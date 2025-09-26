@@ -1,6 +1,5 @@
 #!/usr/bin/env bash
 # …
-# 兼容某些环境的 pipefail
 set -Eeuo pipefail 2>/dev/null || set -Eeuo
 (set -o pipefail) 2>/dev/null || true
 
@@ -71,9 +70,9 @@ create_work_dir(){ mkdir -p "$WORK_DIR"; }
 
 # ======（合入原 trafficcop-manager.sh 的核心功能）======
 install_script(){
-  local script_name="$1"
-  local out="${2:-$script_name}"
-  local out_path="$WORK_DIR/$out"
+local script_name="$1"
+local out="${2:-$script_name}"
+local out_path="$WORK_DIR/$out"
   echo -e "${YELLOW}下载 $script_name ...${NC}"
   curl -fsSL "$REPO_URL/$script_name" | tr -d '\r' > "$out_path"
   chmod +x "$out_path"
@@ -427,5 +426,6 @@ case "${1:-install}" in
   *) echo "用法: $0 [install|menu|agent-only|uninstall-agent|status]"; exit 1 ;;
 esac
 * text=auto eol=lf
+
 
 
