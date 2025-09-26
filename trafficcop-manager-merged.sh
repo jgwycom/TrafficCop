@@ -1,186 +1,117 @@
 #!/usr/bin/env bash
-set -euo pipefail
+# TrafficCop + Prometheus Pushgateway Agent 合并安装器（自愈版）
+# - 强制 bash，非交互装依赖，systemd 失败自动降级 cron @reboot
+# - 继承原 TrafficCop 配置的 别名/网卡/配额
+# - 幂等可重跑；提供 install / agent-only / uninstall-agent / status
 
-# =============================
-# TrafficCop + Prometheus Agent 一键合并安装脚本
-# 兼容你的原TrafficCop配置，新增 Pushgateway metrics 上报
-# Author: ChatGPT merge for jian Ma
-# =============================
+# ------------------ 严格模式 & 错误展示 ------------------
+set -Eeuo pipefail
+trap 'echo -e "\033[31m[ERR]\033[0m 行号:$LINENO 命令:${BASH_COMMAND}" >&2' ERR
 
-# -------- 可自定义的默认项（可通过环境变量覆盖） --------
-: "${PG_URL:=http://45.78.23.232:9091}"       # Pushgateway 地址（按你现在的环境默认）
-: "${JOB_NAME:=trafficcop}"                    # Prometheus job
-: "${AGENT_DIR:=/opt/trafficcop-agent}"        # agent 安装目录
-: "${AGENT_USER:=root}"                        # 运行用户（默认 root，保持与原脚本一致）
-: "${CONFIG_FILE:=/root/TrafficCop/traffic_monitor_config.txt}"   # 原配置文件
-: "${ORIG_DIR:=/root/TrafficCop}"              # 原脚本安装目录
-: "${ORIG_MONITOR:=/root/TrafficCop/traffic_monitor.sh}"          # 原主程序（trafficcop.sh 改名）
-: "${ENV_FILE:=/etc/trafficcop-agent.env}"     # agent 环境变量
-: "${SERVICE_NAME:=trafficcop-agent.service}"  # systemd 服务名
-: "${PUSH_INTERVAL:=10}"                       # 上报间隔(s)
+# ------------------ 默认参数（可用 env 覆盖） ------------------
+: "${PG_URL:=http://45.78.23.232:19091}"         # Pushgateway 地址（按你的中心机）
+: "${JOB_NAME:=trafficcop}"                      # Prometheus job 名
+: "${AGENT_DIR:=/opt/trafficcop-agent}"          # agent 安装目录
+: "${AGENT_USER:=root}"                          # 运行用户
+: "${CONFIG_FILE:=/root/TrafficCop/traffic_monitor_config.txt}"  # 原 TrafficCop 配置
+: "${ORIG_DIR:=/root/TrafficCop}"
+: "${ORIG_MONITOR:=/root/TrafficCop/traffic_monitor.sh}"         # 原主程序（如果需要）
+: "${ENV_FILE:=/etc/trafficcop-agent.env}"       # agent 环境变量文件
+: "${SERVICE_NAME:=trafficcop-agent.service}"    # systemd 服务名
+: "${PUSH_INTERVAL:=10}"                         # 推送间隔秒
+: "${ENABLE_VNSTAT:=1}"                          # 1=尝试月累计；0=跳过
+: "${DOWNLOAD_ORIGINAL:=0}"                      # 1=缺失时尝试拉取原脚本并短暂运行；0=跳过
 
-# -------- 颜色输出 --------
-c_green(){ echo -e "\033[32m$*\033[0m"; }
-c_yellow(){ echo -e "\033[33m$*\033[0m"; }
-c_red(){ echo -e "\033[31m$*\033[0m"; }
+# ------------------ 小工具 ------------------
+green(){ echo -e "\033[32m$*\033[0m"; }
+yellow(){ echo -e "\033[33m$*\033[0m"; }
+red(){ echo -e "\033[31m$*\033[0m"; }
 hr(){ echo "------------------------------------------------------------"; }
 
-need_cmd() {
-  command -v "$1" >/dev/null 2>&1 || { c_red "缺少依赖：$1"; return 1; }
+ensure_root(){
+  if [[ "$(id -u)" -ne 0 ]]; then red "请用 root 运行"; exit 1; fi
 }
 
-ensure_root() {
-  if [ "$(id -u)" -ne 0 ]; then
-    c_red "请以root运行"; exit 1
-  fi
+pm_detect(){
+  command -v apt >/dev/null && echo apt && return
+  command -v dnf >/dev/null && echo dnf && return
+  command -v yum >/dev/null && echo yum && return
+  command -v apk >/devnull 2>&1 && echo apk && return
+  echo "unknown"
 }
 
-detect_pkgmgr() {
-  if command -v apt >/dev/null 2>&1; then echo apt; return; fi
-  if command -v dnf >/dev/null 2>&1; then echo dnf; return; fi
-  if command -v yum >/dev/null 2>&1; then echo yum; return; fi
-  if command -v apk >/dev/null 2>&1; then echo apk; return; fi
-  c_red "未检测到常见包管理器(apt/dnf/yum/apk)，请手动安装 curl jq iproute2 coreutils"; exit 1
-}
-
-install_deps() {
-  local pm; pm=$(detect_pkgmgr)
-  c_green "[1/6] 安装依赖($pm)：curl jq iproute2/coreutils"
+install_deps(){
+  local pm; pm="$(pm_detect)"
+  green "[1/6] 安装依赖（$pm）"
   case "$pm" in
-    apt)  apt update -y && apt install -y curl jq iproute2 coreutils vnstat ;;
-    dnf)  dnf install -y curl jq iproute iproute-tc coreutils vnstat ;;
-    yum)  yum install -y curl jq iproute iproute-tc coreutils vnstat ;;
-    apk)  apk add --no-cache curl jq iproute2 coreutils vnstat ;;
+    apt)
+      export DEBIAN_FRONTEND=noninteractive
+      apt-get update -y
+      apt-get install -y -o Dpkg::Options::=--force-confnew \
+        curl jq iproute2 coreutils ca-certificates cron bash
+      [[ "$ENABLE_VNSTAT" = "1" ]] && apt-get install -y vnstat || true
+      ;;
+    dnf)  dnf install -y curl jq iproute coreutils ca-certificates cronie bash; [[ "$ENABLE_VNSTAT" = "1" ]] && dnf install -y vnstat || true; systemctl enable --now crond 2>/dev/null || true ;;
+    yum)  yum install -y curl jq iproute coreutils ca-certificates cronie bash; [[ "$ENABLE_VNSTAT" = "1" ]] && yum install -y vnstat || true; systemctl enable --now crond 2>/dev/null || true ;;
+    apk)  apk add --no-cache curl jq iproute2 coreutils ca-certificates busybox-initscripts bash; [[ "$ENABLE_VNSTAT" = "1" ]] && apk add --no-cache vnstat || true; rc-update add crond default; rc-service crond start ;;
+    *)
+      yellow "[WARN] 未识别包管理器。请手动安装：curl jq iproute2/coreutils cron bash（可选 vnstat）"
+      ;;
   esac
 }
 
-download_orig_if_missing() {
-  # 来自你之前的一键命令：ypq123456789/TrafficCop
-  if [ ! -f "$ORIG_MONITOR" ]; then
-    c_green "[2/6] 未发现原TrafficCop，拉取并初始化..."
+download_original_if_missing(){
+  [[ "$DOWNLOAD_ORIGINAL" = "1" ]] || { yellow "[跳过] 原 TrafficCop 自动下载（DOWNLOAD_ORIGINAL=0）"; return; }
+  if [[ ! -f "$ORIG_MONITOR" ]]; then
+    green "[2/6] 拉取原 TrafficCop（可选）"
     mkdir -p "$ORIG_DIR"
-    # 下载原始trafficcop.sh为traffic_monitor.sh
     curl -fsSL "https://raw.githubusercontent.com/ypq123456789/TrafficCop/main/trafficcop.sh" \
       | tr -d '\r' > "$ORIG_MONITOR"
     chmod +x "$ORIG_MONITOR"
-    # 首次执行原脚本，进入交互生成配置（你可按需点回车/设定）
-    c_yellow "即将运行原脚本以生成配置（如已安装可Ctrl+C跳过）"
-    bash "$ORIG_MONITOR" || true
+    # 防止阻塞：最多跑 20 秒（用于生成/刷新配置），超时即跳过
+    timeout 20s bash "$ORIG_MONITOR" || true
   else
-    c_green "[2/6] 检测到原TrafficCop脚本：$ORIG_MONITOR"
+    green "[2/6] 已检测到原 TrafficCop：$ORIG_MONITOR"
   fi
 }
 
-# -------- 从原配置/系统里提取节点别名、网卡、流量限额 --------
 trim(){ sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' ; }
 
-parse_from_config() {
-  local key regex value
-  key="$1"; regex="$2"
-  if [ -f "$CONFIG_FILE" ]; then
-    value="$(grep -E "$regex" "$CONFIG_FILE" 2>/dev/null | head -n1 | sed 's/^[#[:space:]]*//' | awk -F'[=:]' '{print $2}' | tr -d "\"'" | trim)"
-    [ -n "${value:-}" ] && echo "$value" && return 0
+from_cfg(){
+  # 从原配置提取键值（支持多种关键词）
+  local regex="$1"
+  [[ -f "$CONFIG_FILE" ]] || { echo ""; return; }
+  grep -E "$regex" "$CONFIG_FILE" 2>/dev/null | head -n1 | sed 's/^[#[:space:]]*//' \
+    | awk -F'[=:]' '{print $2}' | tr -d "\"'" | trim || true
+}
+
+detect_iface(){
+  local v; v="$(from_cfg '(IFACE|iface|网卡)')"
+  [[ -n "${v:-}" ]] && { echo "$v"; return; }
+  ip route 2>/dev/null | awk '/default/ {print $5; exit}' || echo eth0
+}
+
+detect_instance(){
+  # 优先别名/主机名字段；否则 hostname；再退化为 IP 或 unknown
+  local v ip
+  v="$(from_cfg '(HOSTNAME_ALIAS|HOST_NAME|HOSTNAME|ALIAS|alias|别名|主机名)')"
+  [[ -z "$v" ]] && v="$(hostname 2>/dev/null || true)"
+  if [[ -z "$v" ]]; then
+    ip="$(hostname -I 2>/dev/null | awk '{print $1}')"
+    [[ -n "$ip" ]] && v="$ip" || v="unknown"
   fi
-  return 1
-}
-
-detect_iface() {
-  # 先从配置猜
-  local v
-  v="$(parse_from_config IFACE '(IFACE|iface|网卡)')" || true
-  if [ -n "$v" ]; then echo "$v"; return; fi
-  # 退化为默认路由网卡
-  v="$(ip route 2>/dev/null | awk '/default/ {print $5; exit}')"
-  [ -n "$v" ] && echo "$v" || echo "eth0"
-}
-
-# 尽最大努力从配置里读到“别名/主机名”；找不到用 hostname
-detect_node_alias() {
-  local v
-  v="$(parse_from_config HOSTNAME '(HOSTNAME_ALIAS|HOST_NAME|HOSTNAME|alias|别名|主机名)')" || true
-  [ -z "$v" ] && v="$(parse_from_config ALIAS '(ALIAS|alias|别名)')" || true
-  [ -z "$v" ] && v="$(hostname 2>/dev/null)" || true
   echo "$v"
 }
 
-# 尝试解析“限额”，支持 500G/1T/800M 等；统一换算为字节
-parse_quota_bytes() {
+parse_quota_bytes(){
+  # 支持 LIMIT/QUOTA/上限/配额 等，支持 500G/1T/800M/123B
   local raw unit num bytes
-  raw="$(parse_from_config LIMIT '(LIMIT|QUOTA|上限|限制|配额)')" || true
-  if [ -z "$raw" ]; then echo 0; return; fi
-  raw="$(echo "$raw" | tr '[:lower:]' '[:upper:]' | tr -d ' ' )"
-  # 提取数值和单位
-  num="$(echo "$raw" | grep -oE '[0-9]+(\.[0-9]+)?' | head -n1)"
-  unit="$(echo "$raw" | grep -oE '(TB|T|GB|G|MB|M|KB|K|B)$' | head -n1)"
-  [ -z "$num" ] && { echo 0; return; }
-  case "$unit" in
-    TB|T) bytes=$(awk -v n="$num" 'BEGIN{printf "%.0f", n*1024*1024*1024*1024}') ;;
-    GB|G|"") bytes=$(awk -v n="$num" 'BEGIN{printf "%.0f", n*1024*1024*1024}') ;; # 默认按GB
-    MB|M) bytes=$(awk -v n="$num" 'BEGIN{printf "%.0f", n*1024*1024}') ;;
-    KB|K) bytes=$(awk -v n="$num" 'BEGIN{printf "%.0f", n*1024}') ;;
-    B)     bytes=$(awk -v n="$num" 'BEGIN{printf "%.0f", n}') ;;
-    *)     bytes=0 ;;
-  esac
-  echo "${bytes:-0}"
-}
-
-detect_instance() {
-  # 以“自定义别名”为 instance；没有就用主机名；最后用IP
-  local a ip
-  a="$(detect_node_alias)"
-  if [ -n "$a" ]; then echo "$a"; return; fi
-  ip="$(hostname -I 2>/dev/null | awk '{print $1}')"
-  [ -n "$ip" ] && echo "$ip" || echo "unknown"
-}
-
-# -------- 写入 agent 主程序 --------
-write_agent() {
-  c_green "[3/6] 写入 agent 主程序：$AGENT_DIR/agent.sh"
-  mkdir -p "$AGENT_DIR"
-  cat > "$AGENT_DIR/agent.sh" <<'EOF'
-#!/usr/bin/env bash
-set -euo pipefail
-
-# 从 env 文件读取
-: "${ENV_FILE:=/etc/trafficcop-agent.env}"
-[ -f "$ENV_FILE" ] && . "$ENV_FILE"
-
-: "${PG_URL:?缺少 PG_URL}"
-: "${JOB_NAME:=trafficcop}"
-: "${PUSH_INTERVAL:=10}"
-: "${CONFIG_FILE:=/root/TrafficCop/traffic_monitor_config.txt}"
-
-trim(){ sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' ; }
-parse_from_config() {
-  local key="$1" regex="$2" value
-  if [ -f "$CONFIG_FILE" ]; then
-    value="$(grep -E "$regex" "$CONFIG_FILE" 2>/dev/null | head -n1 | sed 's/^[#[:space:]]*//' | awk -F'[=:]' '{print $2}' | tr -d "\"'" | trim)"
-    [ -n "${value:-}" ] && echo "$value" && return 0
-  fi
-  return 1
-}
-
-detect_iface() {
-  local v
-  v="$(parse_from_config IFACE '(IFACE|iface|网卡)')" || true
-  [ -z "$v" ] && v="$(ip route 2>/dev/null | awk '/default/ {print $5; exit}')"
-  [ -n "$v" ] && echo "$v" || echo "eth0"
-}
-detect_instance() {
-  local v
-  v="$(parse_from_config HOSTNAME '(HOSTNAME_ALIAS|HOST_NAME|HOSTNAME|alias|别名|主机名)')" || true
-  [ -z "$v" ] && v="$(parse_from_config ALIAS '(ALIAS|alias|别名)')" || true
-  [ -z "$v" ] && v="$(hostname 2>/dev/null)" || true
-  echo "$v"
-}
-parse_quota_bytes() {
-  local raw unit num bytes
-  raw="$(parse_from_config LIMIT '(LIMIT|QUOTA|上限|限制|配额)')" || true
-  [ -z "$raw" ] && { echo 0; return; }
+  raw="$(from_cfg '(LIMIT|QUOTA|上限|限制|配额)')" || true
+  [[ -z "$raw" ]] && { echo 0; return; }
   raw="$(echo "$raw" | tr '[:lower:]' '[:upper:]' | tr -d ' ')"
   num="$(echo "$raw" | grep -oE '[0-9]+(\.[0-9]+)?' | head -n1)"
   unit="$(echo "$raw" | grep -oE '(TB|T|GB|G|MB|M|KB|K|B)$' | head -n1)"
-  [ -z "$num" ] && { echo 0; return; }
+  [[ -z "$num" ]] && { echo 0; return; }
   case "$unit" in
     TB|T) bytes=$(awk -v n="$num" 'BEGIN{printf "%.0f", n*1024*1024*1024*1024}') ;;
     GB|G|"") bytes=$(awk -v n="$num" 'BEGIN{printf "%.0f", n*1024*1024*1024}') ;;
@@ -192,84 +123,134 @@ parse_quota_bytes() {
   echo "${bytes:-0}"
 }
 
-push_metrics() {
-  local iface="$1" instance="$2" quota_bytes="$3"
-  # counters since boot
+write_agent(){
+  green "[3/6] 写入 agent：$AGENT_DIR/agent.sh"
+  mkdir -p "$AGENT_DIR"
+  cat > "$AGENT_DIR/agent.sh" <<"EOS"
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+: "${ENV_FILE:=/etc/trafficcop-agent.env}"
+[[ -f "$ENV_FILE" ]] && . "$ENV_FILE"
+
+: "${PG_URL:?缺少 PG_URL}"
+: "${JOB_NAME:=trafficcop}"
+: "${PUSH_INTERVAL:=10}"
+: "${CONFIG_FILE:=/root/TrafficCop/traffic_monitor_config.txt}"
+
+trim(){ sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' ; }
+
+from_cfg(){
+  local regex="$1"
+  [[ -f "$CONFIG_FILE" ]] || { echo ""; return; }
+  grep -E "$regex" "$CONFIG_FILE" 2>/dev/null | head -n1 | sed 's/^[#[:space:]]*//' \
+    | awk -F'[=:]' '{print $2}' | tr -d "\"'" | trim || true
+}
+
+detect_iface(){
+  local v; v="$(from_cfg '(IFACE|iface|网卡)')"
+  [[ -z "$v" ]] && v="$(ip route 2>/dev/null | awk "/default/ {print \$5; exit}")"
+  [[ -n "$v" ]] && echo "$v" || echo "eth0"
+}
+
+detect_instance(){
+  local v; v="$(from_cfg '(HOSTNAME_ALIAS|HOST_NAME|HOSTNAME|ALIAS|alias|别名|主机名)')"
+  [[ -z "$v" ]] && v="$(hostname 2>/dev/null || true)"
+  [[ -n "$v" ]] && echo "$v" || echo "unknown"
+}
+
+parse_quota_bytes(){
+  local raw unit num bytes
+  raw="$(from_cfg '(LIMIT|QUOTA|上限|限制|配额)')" || true
+  [[ -z "$raw" ]] && { echo 0; return; }
+  raw="$(echo "$raw" | tr '[:lower:]' '[:upper:]' | tr -d ' ')"
+  num="$(echo "$raw" | grep -oE '[0-9]+(\.[0-9]+)?' | head -n1)"
+  unit="$(echo "$raw" | grep -oE '(TB|T|GB|G|MB|M|KB|K|B)$' | head -n1)"
+  [[ -z "$num" ]] && { echo 0; return; }
+  case "$unit" in
+    TB|T) bytes=$(awk -v n="$num" 'BEGIN{printf "%.0f", n*1024*1024*1024*1024}') ;;
+    GB|G|"") bytes=$(awk -v n="$num" 'BEGIN{printf "%.0f", n*1024*1024*1024}') ;;
+    MB|M) bytes=$(awk -v n="$num" 'BEGIN{printf "%.0f", n*1024*1024}') ;;
+    KB|K) bytes=$(awk -v n="$num" 'BEGIN{printf "%.0f", n*1024}') ;;
+    B)     bytes=$(awk -v n="$num" 'BEGIN{printf "%.0f", n}') ;;
+    *)     bytes=0 ;;
+  esac
+  echo "${bytes:-0}"
+}
+
+push_metrics(){
+  local iface="$1" instance="$2" quota="$3"
+
   local rx tx
   rx="$(cat /sys/class/net/"$iface"/statistics/rx_bytes 2>/dev/null || echo 0)"
   tx="$(cat /sys/class/net/"$iface"/statistics/tx_bytes 2>/dev/null || echo 0)"
 
-  # 月累计(可选) — 依赖 vnstat，抓当月 rx/tx
   local month_rx=0 month_tx=0
   if command -v vnstat >/dev/null 2>&1; then
-    # 取当前月份的条目(第一个 month 对象)
     read -r month_rx month_tx < <(
-      vnstat --json 2>/dev/null \
-      | jq -r --arg IF "$iface" '
-          .interfaces[] | select(.name==$IF) | .traffic.months[0] // {} |
-          "\(.rx*1024) \(.tx*1024)"' 2>/dev/null || echo "0 0"
+      vnstat --json 2>/dev/null | jq -r --arg IF "$iface" '
+        .interfaces[] | select(.name==$IF) | .traffic.months[0] // {} |
+        "\(.rx*1024) \(.tx*1024)"' 2>/dev/null || echo "0 0"
     )
   fi
 
-  # 方便在Grafana里展示“节点元信息”
-  # 注：配额也以 gauge 形式上报；quota_bytes=0 表示未知
-  cat <<METRICS >/tmp/trafficcop_metrics.txt
+  cat > /tmp/trafficcop_metrics.txt <<METRICS
+# TYPE traffic_rx_bytes_total counter
 traffic_rx_bytes_total{job="$JOB_NAME",instance="$instance",iface="$iface"} $rx
+# TYPE traffic_tx_bytes_total counter
 traffic_tx_bytes_total{job="$JOB_NAME",instance="$instance",iface="$iface"} $tx
+# TYPE traffic_month_rx_bytes gauge
 traffic_month_rx_bytes{job="$JOB_NAME",instance="$instance",iface="$iface"} ${month_rx:-0}
+# TYPE traffic_month_tx_bytes gauge
 traffic_month_tx_bytes{job="$JOB_NAME",instance="$instance",iface="$iface"} ${month_tx:-0}
-traffic_node_quota_bytes{job="$JOB_NAME",instance="$instance",iface="$iface"} ${quota_bytes:-0}
+# TYPE traffic_node_quota_bytes gauge
+traffic_node_quota_bytes{job="$JOB_NAME",instance="$instance"} ${quota:-0}
+# TYPE traffic_agent_up gauge
 traffic_agent_up{job="$JOB_NAME",instance="$instance"} 1
 METRICS
 
-  # 分组键：/job/<job>/instance/<instance>
-  # iface 作为指标label
   curl -fsS --retry 2 --data-binary @/tmp/trafficcop_metrics.txt \
     "$PG_URL/metrics/job/$JOB_NAME/instance/$(printf "%s" "$instance" | sed 's/[ /]/_/g')"
 }
 
-main_loop() {
+main_loop(){
   local iface instance quota
-  iface="$(detect_iface)"
+  iface="${IFACE_OVERRIDE:-$(detect_iface)}"
   instance="${INSTANCE_OVERRIDE:-$(detect_instance)}"
   quota="${QUOTA_BYTES_OVERRIDE:-$(parse_quota_bytes)}"
-  [ -n "${IFACE_OVERRIDE:-}" ] && iface="$IFACE_OVERRIDE"
   while true; do
     push_metrics "$iface" "$instance" "$quota" || true
-    sleep "$PUSH_INTERVAL"
+    sleep "${PUSH_INTERVAL}"
   done
 }
 
 main_loop
-EOF
+EOS
   chmod +x "$AGENT_DIR/agent.sh"
 }
 
-# -------- 写入 agent 环境变量 --------
-write_env() {
-  c_green "[4/6] 写入环境变量：$ENV_FILE"
+write_env(){
+  green "[4/6] 写入环境文件：$ENV_FILE"
   local IFACE DETECT_INSTANCE QUOTA
   IFACE="$(detect_iface)"
   DETECT_INSTANCE="$(detect_instance)"
   QUOTA="$(parse_quota_bytes)"
-
   cat > "$ENV_FILE" <<EOF
-# trafficcop-agent 环境变量（可手动调整）
+# trafficcop-agent 环境变量（可覆盖）
 PG_URL="$PG_URL"
 JOB_NAME="$JOB_NAME"
 PUSH_INTERVAL="$PUSH_INTERVAL"
 CONFIG_FILE="$CONFIG_FILE"
 
-# 自动探测结果（如需覆盖可修改）
+# 自动探测结果（可按需覆盖）
 IFACE_OVERRIDE="$IFACE"
 INSTANCE_OVERRIDE="$DETECT_INSTANCE"
 QUOTA_BYTES_OVERRIDE="$QUOTA"
 EOF
 }
 
-# -------- 写入 systemd 服务 --------
-write_service() {
-  c_green "[5/6] 创建 systemd 服务：$SERVICE_NAME"
+write_service(){
+  green "[5/6] 注册 systemd/crond"
   cat > "/etc/systemd/system/$SERVICE_NAME" <<EOF
 [Unit]
 Description=TrafficCop Pushgateway Agent
@@ -282,64 +263,78 @@ EnvironmentFile=$ENV_FILE
 ExecStart=$AGENT_DIR/agent.sh
 Restart=always
 RestartSec=5
-RuntimeMaxSec=0
 
 [Install]
 WantedBy=multi-user.target
 EOF
-  systemctl daemon-reload
-  systemctl enable "$SERVICE_NAME" --now
+
+  systemctl daemon-reload || true
+
+  # 先尝试 systemd
+  if systemctl enable --now "$SERVICE_NAME" 2>/dev/null; then
+    green "[OK] systemd 已启用 $SERVICE_NAME"
+  else
+    yellow "[WARN] systemd 启动失败，切换 cron @reboot 兜底"
+    echo "@reboot root nohup $AGENT_DIR/agent.sh >/var/log/trafficcop-agent.log 2>&1 &" \
+      > /etc/cron.d/trafficcop-agent
+    # 立即启动一次
+    nohup "$AGENT_DIR/agent.sh" >/var/log/trafficcop-agent.log 2>&1 &
+    # 确保 cron 存在并运行
+    (service cron restart 2>/dev/null || systemctl restart cron 2>/dev/null || true)
+  fi
 }
 
-show_status() {
+show_status(){
   hr
-  systemctl --no-pager status "$SERVICE_NAME" || true
+  systemctl status "$SERVICE_NAME" --no-pager -n 30 2>/dev/null || yellow "[info] 无 systemd 或未启用（可能已使用 cron 兜底）"
   hr
-  echo "环境变量：$ENV_FILE"
-  cat "$ENV_FILE" || true
+  echo "== 环境文件：$ENV_FILE =="; cat "$ENV_FILE" 2>/dev/null || true
   hr
-  echo "如需手动测试："
-  echo "  PG_URL=$PG_URL $AGENT_DIR/agent.sh (Ctrl+C 结束)"
+  echo "== 关键路径 =="; ls -l "$AGENT_DIR/agent.sh" 2>/dev/null || true; ls -l "/etc/systemd/system/$SERVICE_NAME" 2>/dev/null || true
+  hr
+  local HN; HN="$(hostname -s || echo unknown)"
+  echo "== Pushgateway 快速检查（匹配本机名：$HN） =="
+  curl -fsSL "$PG_URL/metrics" | grep -E '^traffic_(rx|tx)_bytes_total' | grep -i "$HN" | head -n 3 || echo "(稍等 15s 再试)"
 }
 
-uninstall_all() {
-  c_yellow "卸载 agent（不动原TrafficCop限制/通知）"
+uninstall_agent(){
+  yellow "[卸载] 仅移除 Pushgateway agent，不影响原 TrafficCop"
   systemctl disable --now "$SERVICE_NAME" 2>/dev/null || true
   rm -f "/etc/systemd/system/$SERVICE_NAME"
-  systemctl daemon-reload
+  systemctl daemon-reload 2>/dev/null || true
+  rm -f /etc/cron.d/trafficcop-agent
+  pkill -f "$AGENT_DIR/agent.sh" 2>/dev/null || true
   rm -rf "$AGENT_DIR" "$ENV_FILE"
-  c_green "已卸载 Pushgateway agent。"
+  green "[完成] agent 已卸载"
 }
 
-menu() {
-  cat <<'M'
-[ TrafficCop 合并安装器 ]
-1) 安装/更新 TrafficCop 原脚本(若缺失) + 安装/更新 Pushgateway agent
-2) 仅安装/更新 Pushgateway agent
-3) 查看 agent 运行状态
-4) 卸载 Pushgateway agent
-0) 退出
-M
-  read -rp "请选择 [0-4]: " ch
-  case "$ch" in
-    1) install_deps; download_orig_if_missing; write_agent; write_env; write_service; show_status ;;
-    2) install_deps; write_agent; write_env; write_service; show_status ;;
-    3) show_status ;;
-    4) uninstall_all ;;
-    0) exit 0 ;;
-    *) echo "无效选项";;
-  esac
+cmd_install(){
+  ensure_root
+  install_deps
+  download_original_if_missing
+  write_agent
+  write_env
+  write_service
+  show_status
 }
 
-# ---------------- 主流程 ----------------
-ensure_root
+cmd_agent_only(){
+  ensure_root
+  install_deps
+  write_agent
+  write_env
+  write_service
+  show_status
+}
 
-if [ "${1:-}" = "install" ]; then
-  install_deps; download_orig_if_missing; write_agent; write_env; write_service; show_status
-elif [ "${1:-}" = "agent-only" ]; then
-  install_deps; write_agent; write_env; write_service; show_status
-elif [ "${1:-}" = "uninstall-agent" ]; then
-  uninstall_all
-else
-  menu
-fi
+cmd_status(){
+  show_status
+}
+
+case "${1:-install}" in
+  install)         cmd_install ;;
+  agent-only)      cmd_agent_only ;;
+  uninstall-agent) uninstall_agent ;;
+  status)          cmd_status ;;
+  *) echo "用法: $0 [install|agent-only|uninstall-agent|status]"; exit 1 ;;
+esac
