@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # …
-# 兼容某些奇怪环境：不支持 pipefail 时不报错退出
+# 兼容某些环境的 pipefail
 set -Eeuo pipefail 2>/dev/null || set -Eeuo
 (set -o pipefail) 2>/dev/null || true
 
@@ -79,15 +79,17 @@ install_script(){
   chmod +x "$out_path"
   echo -e "${GREEN}已保存 $out → $out_path${NC}"
 }
-run_script(){ # 运行已下载脚本（交互保持）
+
+run_script(){ # 运行已下载脚本（绑定到 TTY）
   local p="$1"
   if [ -f "$p" ]; then
     echo -e "${YELLOW}运行 $p ...${NC}"
-    bash "$p"
+    bash "$p" < /dev/tty > /dev/tty 2>&1
   else
     echo -e "${RED}脚本不存在: $p${NC}"
   fi
 }
+
 install_monitor(){ # 原“安装流量监控”
   echo -e "${CYAN}正在安装流量监控（原脚本）...${NC}"
   install_script "trafficcop.sh" "traffic_monitor.sh"
@@ -425,4 +427,5 @@ case "${1:-install}" in
   *) echo "用法: $0 [install|menu|agent-only|uninstall-agent|status]"; exit 1 ;;
 esac
 * text=auto eol=lf
+
 
