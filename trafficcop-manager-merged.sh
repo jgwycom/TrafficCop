@@ -1,13 +1,22 @@
 #!/usr/bin/env bash
-# …
+# TrafficCop 交互管理器 + Pushgateway Agent 一体化脚本（最终版）
+# - 未安装过原代码：先进入原脚本交互（每台独立配置），再自动装上报 Agent
+# - 已安装过原代码：可仅装/重装 Agent
+# - 兼容 curl | bash 管道执行时的交互（自动把 stdin 绑定到 /dev/tty）
+#
+# 原始仓库（交互安装脚本/预设配置等）：
+#   https://github.com/ypq123456789/TrafficCop
+# 如需改为你的 Fork，可将 REPO_URL 改成你的 raw 地址。
+
+# 兼容某些环境的 pipefail（避免一上来就因 set -o pipefail 不可用而退出）
 set -Eeuo pipefail 2>/dev/null || set -Eeuo
 (set -o pipefail) 2>/dev/null || true
 
-# —— 关键：如通过管道执行，确保交互读取来自你的终端而不是管道 ——
+# —— 若通过管道执行且 stdin 不是终端，则把 stdin 绑定到 /dev/tty，保证交互正常 ——
 { tty >/dev/null 2>&1 && [ ! -t 0 ]; } && exec </dev/tty || true
 
 # ================= 可调参数（也可用环境变量覆盖） =================
-: "${PG_URL:=http://45.78.23.232:19091}"   # Pushgateway 地址（可用环境变量 PG_URL 覆盖）
+: "${PG_URL:=http://45.78.23.232:19091}"   # Pushgateway 地址（环境变量 PG_URL 可覆盖）
 : "${JOB_NAME:=trafficcop}"                 # Prometheus job
 : "${PUSH_INTERVAL:=10}"                    # 上报间隔(秒)
 : "${ENABLE_VNSTAT:=1}"                     # 采集当月累计 1=开 0=关
@@ -68,18 +77,17 @@ install_deps(){
 
 create_work_dir(){ mkdir -p "$WORK_DIR"; }
 
-# ======（合入原 trafficcop-manager.sh 的核心功能）======
-install_script(){
-local script_name="$1"
-local out="${2:-$script_name}"
-local out_path="$WORK_DIR/$out"
+# ======（对接原 trafficcop 管理逻辑：下载/运行/菜单）======
+install_script(){ # 下载并保存原仓库脚本（保持交互式安装）
+  local script_name="$1"
+  local out="${2:-$script_name}"
+  local out_path="$WORK_DIR/$out"
   echo -e "${YELLOW}下载 $script_name ...${NC}"
   curl -fsSL "$REPO_URL/$script_name" | tr -d '\r' > "$out_path"
   chmod +x "$out_path"
   echo -e "${GREEN}已保存 $out → $out_path${NC}"
 }
-
-run_script(){ # 运行已下载脚本（绑定到 TTY）
+run_script(){ # 运行已下载脚本（绑定到 TTY，保证交互）
   local p="$1"
   if [ -f "$p" ]; then
     echo -e "${YELLOW}运行 $p ...${NC}"
@@ -88,7 +96,6 @@ run_script(){ # 运行已下载脚本（绑定到 TTY）
     echo -e "${RED}脚本不存在: $p${NC}"
   fi
 }
-
 install_monitor(){ # 原“安装流量监控”
   echo -e "${CYAN}正在安装流量监控（原脚本）...${NC}"
   install_script "trafficcop.sh" "traffic_monitor.sh"
@@ -112,16 +119,13 @@ install_pushplus_notifier(){
 }
 install_serverchan_notifier(){
   echo -e "${CYAN}安装 Server酱 通知...${NC}"
-  # 若仓库不存在则使用本地同名文件
   if curl -s --head "$REPO_URL/serverchan_notifier.sh" | grep -q "HTTP/2 200\|HTTP/1.1 200"; then
     install_script "serverchan_notifier.sh"
-  elif [ -f "serverchan_notifier.sh" ]; then
-    cp "serverchan_notifier.sh" "$WORK_DIR/serverchan_notifier.sh" && chmod +x "$WORK_DIR/serverchan_notifier.sh"
+    run_script "$WORK_DIR/serverchan_notifier.sh"
+    echo -e "${GREEN}Server酱 通知安装完成${NC}"
   else
-    echo -e "${RED}未找到 serverchan_notifier.sh${NC}"; read -r -p "按回车继续..." _ || true; return
+    echo -e "${YELLOW}[WARN] 仓库没有 serverchan_notifier.sh，跳过${NC}"
   fi
-  run_script "$WORK_DIR/serverchan_notifier.sh"
-  echo -e "${GREEN}Server酱 通知安装完成${NC}"
   read -r -p "按回车继续..." _ || true
 }
 remove_traffic_limit(){
@@ -139,7 +143,7 @@ view_logs(){
   echo "4) Server酱 通知日志"
   echo "0) 返回"
   read -r -p "选择 [0-4]: " c
-  case "$c" in
+  case "$c$" in
     1) [ -f "$WORK_DIR/traffic_monitor.log" ] && tail -n 30 "$WORK_DIR/traffic_monitor.log" || echo -e "${RED}无日志${NC}" ;;
     2) [ -f "$WORK_DIR/tg_notifier_cron.log" ] && tail -n 30 "$WORK_DIR/tg_notifier_cron.log" || echo -e "${RED}无日志${NC}" ;;
     3) [ -f "$WORK_DIR/pushplus_notifier_cron.log" ] && tail -n 30 "$WORK_DIR/pushplus_notifier_cron.log" || echo -e "${RED}无日志${NC}" ;;
@@ -197,6 +201,7 @@ stop_all_services(){
   crontab -l | grep -v -E "traffic_monitor.sh|tg_notifier.sh|pushplus_notifier.sh|serverchan_notifier.sh" | crontab - || true
   echo -e "${GREEN}已停止${NC}"; read -r -p "按回车继续..." _ || true
 }
+
 # ====== 原管理器菜单（增加了第9项：Agent 管理） ======
 show_main_menu(){
   clear
@@ -244,7 +249,9 @@ write_agent(){
   mkdir -p "$AGENT_DIR"
   cat > "$AGENT_DIR/agent.sh" <<"EOS"
 #!/usr/bin/env bash
-set -Eeuo pipefail
+set -Eeuo pipefail 2>/dev/null || set -Eeuo
+(set -o pipefail) 2>/dev/null || true
+
 : "${ENV_FILE:=/etc/trafficcop-agent.env}"
 [ -f "$ENV_FILE" ] && . "$ENV_FILE"
 
@@ -399,6 +406,7 @@ menu_agent(){
     read -r -p "按回车继续..." _ || true
   done
 }
+
 # ============= 顶层命令 =============
 cmd_install(){ check_root; install_deps; create_work_dir; install_monitor; write_agent; write_env; write_service; show_status; }
 cmd_menu(){ check_root; create_work_dir; while true; do show_main_menu; read -r -p "请选择 [0-9]: " ch; case "$ch" in
@@ -425,7 +433,3 @@ case "${1:-install}" in
   status) cmd_status ;;
   *) echo "用法: $0 [install|menu|agent-only|uninstall-agent|status]"; exit 1 ;;
 esac
-* text=auto eol=lf
-
-
-
