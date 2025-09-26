@@ -1,10 +1,8 @@
 #!/usr/bin/env bash
-# TrafficCop 交互管理器 + Pushgateway Agent 一体化脚本
-# - 未安装过原代码：先进入原脚本交互（保持一机一配置），再自动装上报Agent
-# - 已安装过原代码：可仅装/重装Agent
-# - 支持 curl | bash 管道执行下的交互（重连stdin到/dev/tty）
-set -Eeuo pipefail
-trap 'echo -e "\033[31m[ERR]\033[0m line:$LINENO cmd:${BASH_COMMAND}" >&2' ERR
+# …
+# 兼容某些奇怪环境：不支持 pipefail 时不报错退出
+set -Eeuo pipefail 2>/dev/null || set -Eeuo
+(set -o pipefail) 2>/dev/null || true
 
 # —— 关键：如通过管道执行，确保交互读取来自你的终端而不是管道 ——
 { tty >/dev/null 2>&1 && [ ! -t 0 ]; } && exec </dev/tty || true
@@ -424,3 +422,4 @@ case "${1:-install}" in
   status) cmd_status ;;
   *) echo "用法: $0 [install|menu|agent-only|uninstall-agent|status]"; exit 1 ;;
 esac
+
