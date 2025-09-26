@@ -70,8 +70,10 @@ install_deps(){
 create_work_dir(){ mkdir -p "$WORK_DIR"; }
 
 # ======（合入原 trafficcop-manager.sh 的核心功能）======
-install_script(){ # 下载并保存原仓库脚本（保持交互式安装）
-  local script_name="$1" out="${2:-$script_name}" out_path="$WORK_DIR/$out"
+install_script(){
+  local script_name="$1"
+  local out="${2:-$script_name}"
+  local out_path="$WORK_DIR/$out"
   echo -e "${YELLOW}下载 $script_name ...${NC}"
   curl -fsSL "$REPO_URL/$script_name" | tr -d '\r' > "$out_path"
   chmod +x "$out_path"
@@ -422,4 +424,5 @@ case "${1:-install}" in
   status) cmd_status ;;
   *) echo "用法: $0 [install|menu|agent-only|uninstall-agent|status]"; exit 1 ;;
 esac
+* text=auto eol=lf
 
