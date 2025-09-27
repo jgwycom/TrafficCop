@@ -1,435 +1,410 @@
 #!/usr/bin/env bash
-# TrafficCop 交互管理器 + Pushgateway Agent 一体化脚本（最终版）
-# - 未安装过原代码：先进入原脚本交互（每台独立配置），再自动装上报 Agent
-# - 已安装过原代码：可仅装/重装 Agent
-# - 兼容 curl | bash 管道执行时的交互（自动把 stdin 绑定到 /dev/tty）
-#
-# 原始仓库（交互安装脚本/预设配置等）：
-#   https://github.com/ypq123456789/TrafficCop
-# 如需改为你的 Fork，可将 REPO_URL 改成你的 raw 地址。
+# trafficcop-manager-merged.sh
+# Robust installer/manager for TrafficCop Pushgateway Agent
+# Tested on Debian/Ubuntu-family systemd hosts
+set -Eeuo pipefail
 
-# 兼容某些环境的 pipefail（避免一上来就因 set -o pipefail 不可用而退出）
-set -Eeuo pipefail 2>/dev/null || set -Eeuo
-(set -o pipefail) 2>/dev/null || true
+# ===== Default Configs (can be overridden in /etc/trafficcop-agent.env) =====
+DEFAULT_PG_URL="http://45.78.23.232:19091"
+DEFAULT_JOB_NAME="trafficcop"
+DEFAULT_INSTANCE="$(hostname -f 2>/dev/null || hostname)"
+DEFAULT_PUSH_INTERVAL="10"           # seconds
+DEFAULT_CURL_TIMEOUT="5"             # seconds
+DEFAULT_IFACES="AUTO"                # AUTO | space-separated list | "*" = all non-lo
+DEFAULT_RUN_DIR="/run/trafficcop"
+DEFAULT_METRICS_PATH="${DEFAULT_RUN_DIR}/metrics.prom"
+DEFAULT_LOG_LEVEL="info"             # info|debug
 
-# —— 若通过管道执行且 stdin 不是终端，则把 stdin 绑定到 /dev/tty，保证交互正常 ——
-{ tty >/dev/null 2>&1 && [ ! -t 0 ]; } && exec </dev/tty || true
-
-# ================= 可调参数（也可用环境变量覆盖） =================
-: "${PG_URL:=http://45.78.23.232:19091}"   # Pushgateway 地址（环境变量 PG_URL 可覆盖）
-: "${JOB_NAME:=trafficcop}"                 # Prometheus job
-: "${PUSH_INTERVAL:=10}"                    # 上报间隔(秒)
-: "${ENABLE_VNSTAT:=1}"                     # 采集当月累计 1=开 0=关
-WORK_DIR="/root/TrafficCop"
-REPO_URL="https://raw.githubusercontent.com/ypq123456789/TrafficCop/main"
-
-ENV_FILE="/etc/trafficcop-agent.env"
+# ===== Paths =====
 AGENT_DIR="/opt/trafficcop-agent"
-SERVICE_NAME="trafficcop-agent.service"
-CONFIG_FILE_CANDIDATES=(
-  "/root/TrafficCop/traffic_monitor_config.txt"
-  "/etc/trafficcop/traffic_monitor_config.txt"
-  "/etc/trafficcop/config"
-  "/opt/trafficcop/traffic_monitor_config.txt"
-)
-# ===============================================================
+AGENT_BIN="${AGENT_DIR}/agent.sh"
+ENV_FILE="/etc/trafficcop-agent.env"
+SERVICE_FILE="/etc/systemd/system/trafficcop-agent.service"
+CRON_FILE="/etc/cron.d/trafficcop-agent" # 旧版本兜底
+UNIT_NAME="trafficcop-agent.service"
 
-RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[0;33m'
-CYAN='\033[0;36m'; PURPLE='\033[0;35m'; NC='\033[0m'
-hr(){ echo "------------------------------------------------------------"; }
-check_root(){ [ "$(id -u)" -eq 0 ] || { echo -e "${RED}请用 root 运行${NC}"; exit 1; }; }
+# ===== CLI Flags =====
+FLAG_OVERWRITE="false"
+FLAG_KEEP="false"
+FLAG_UNINSTALL="false"
+FLAG_CLEAR_PG="false"
+FLAG_YES="false"
 
-pm_detect(){
-  command -v apt >/dev/null 2>&1 && { echo apt; return; }
-  command -v dnf >/dev/null 2>&1 && { echo dnf; return; }
-  command -v yum >/dev/null 2>&1 && { echo yum; return; }
-  command -v apk >/dev/null 2>&1 && { echo apk; return; }
-  echo unknown
-}
-install_deps(){
-  local pm; pm="$(pm_detect)"
-  echo -e "${GREEN}[依赖] 包管理器: ${pm}${NC}"
-  case "$pm" in
-    apt)
-      export DEBIAN_FRONTEND=noninteractive
-      apt-get update -y >/dev/null
-      apt-get install -y -o Dpkg::Options::=--force-confnew curl jq iproute2 coreutils ca-certificates cron bash >/dev/null
-      [[ "$ENABLE_VNSTAT" = "1" ]] && apt-get install -y vnstat >/dev/null || true
-      ;;
-    dnf)
-      dnf install -y curl jq iproute coreutils ca-certificates cronie bash >/dev/null
-      [[ "$ENABLE_VNSTAT" = "1" ]] && dnf install -y vnstat >/dev/null || true
-      systemctl enable --now crond >/dev/null 2>&1 || true
-      ;;
-    yum)
-      yum install -y curl jq iproute coreutils ca-certificates cronie bash >/dev/null
-      [[ "$ENABLE_VNSTAT" = "1" ]] && yum install -y vnstat >/dev/null || true
-      systemctl enable --now crond >/dev/null 2>&1 || true
-      ;;
-    apk)
-      apk add --no-cache curl jq iproute2 coreutils ca-certificates bash busybox-initscripts >/dev/null
-      [[ "$ENABLE_VNSTAT" = "1" ]] && apk add --no-cache vnstat >/dev/null || true
-      rc-update add crond default; rc-service crond start
-      ;;
-    *) echo -e "${YELLOW}[WARN] 未识别包管理器，请手工确保 curl/jq/iproute2/cron 可用${NC}" ;;
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --overwrite) FLAG_OVERWRITE="true"; shift;;
+    --keep) FLAG_KEEP="true"; shift;;
+    --uninstall) FLAG_UNINSTALL="true"; shift;;
+    --clear-pg) FLAG_CLEAR_PG="true"; shift;;
+    -y|--yes) FLAG_YES="true"; shift;;
+    -h|--help)
+      cat <<'HLP'
+Usage: trafficcop-manager-merged.sh [options]
+
+Actions (choose one if non-interactive):
+  --overwrite     Fresh reinstall (wipe old, then install)
+  --keep          Keep current installation (no changes)
+  --uninstall     Uninstall everything (service, files)
+Optional:
+  --clear-pg      Also clear Pushgateway metrics for this instance (or whole job if --yes and confirm)
+  -y, --yes       Assume "yes" to prompts (non-interactive)
+
+If no action flags are provided, script will interactively ask:
+  [O]verwrite / [K]eep / [U]ninstall
+HLP
+      exit 0;;
+    *)
+      echo "Unknown option: $1"; exit 2;;
   esac
+done
+
+# ===== Helpers =====
+log() { echo "[$(date +'%F %T')] $*"; }
+die() { echo "ERROR: $*" >&2; exit 1; }
+need_root() { [[ ${EUID:-$(id -u)} -eq 0 ]] || die "Please run as root (sudo -i)."; }
+
+svc_is_installed() { [[ -f "$SERVICE_FILE" ]] || systemctl list-unit-files | grep -q "^trafficcop-agent\.service"; }
+svc_is_active() { systemctl is-active --quiet "$UNIT_NAME"; }
+
+ensure_dirs() {
+  install -d -m 755 "$AGENT_DIR"
+  install -d -m 755 "$(dirname "$ENV_FILE")"
+  install -d -m 755 "$DEFAULT_RUN_DIR"
 }
 
-create_work_dir(){ mkdir -p "$WORK_DIR"; }
-
-# ======（对接原 trafficcop 管理逻辑：下载/运行/菜单）======
-install_script(){ # 下载并保存原仓库脚本（保持交互式安装）
-  local script_name="$1"
-  local out="${2:-$script_name}"
-  local out_path="$WORK_DIR/$out"
-  echo -e "${YELLOW}下载 $script_name ...${NC}"
-  curl -fsSL "$REPO_URL/$script_name" | tr -d '\r' > "$out_path"
-  chmod +x "$out_path"
-  echo -e "${GREEN}已保存 $out → $out_path${NC}"
+stop_disable_service() {
+  systemctl stop "$UNIT_NAME" 2>/dev/null || true
+  systemctl disable "$UNIT_NAME" 2>/dev/null || true
 }
-run_script(){ # 运行已下载脚本（绑定到 TTY，保证交互）
-  local p="$1"
-  if [ -f "$p" ]; then
-    echo -e "${YELLOW}运行 $p ...${NC}"
-    bash "$p" < /dev/tty > /dev/tty 2>&1
+
+remove_old_cron() {
+  rm -f "$CRON_FILE" 2>/dev/null || true
+}
+
+remove_files() {
+  rm -f "$SERVICE_FILE" || true
+  rm -rf "$AGENT_DIR" || true
+  rm -f "$ENV_FILE" || true
+  systemctl daemon-reload || true
+}
+
+detect_existing() {
+  local found="false"
+  [[ -d "$AGENT_DIR" ]] && found="true"
+  svc_is_installed && found="true"
+  [[ -f "$ENV_FILE" ]] && found="true"
+  [[ -f "$CRON_FILE" ]] && found="true"
+  echo "$found"
+}
+
+confirm() {
+  local prompt="$1"
+  if [[ "$FLAG_YES" == "true" ]]; then
+    return 0
+  fi
+  read -r -p "$prompt [y/N]: " ans || true
+  [[ "${ans,,}" == "y" || "${ans,,}" == "yes" ]]
+}
+
+# Read env with defaults (for Pushgateway clearing/self-check)
+read_env_effective() {
+  local PG_URL="$DEFAULT_PG_URL"
+  local JOB="$DEFAULT_JOB_NAME"
+  local INST="$DEFAULT_INSTANCE"
+  if [[ -f "$ENV_FILE" ]]; then
+    # shellcheck disable=SC1090
+    . "$ENV_FILE"
+    PG_URL="${PG_URL:-$DEFAULT_PG_URL}"
+    JOB_NAME="${JOB_NAME:-$DEFAULT_JOB_NAME}"
+    INSTANCE="${INSTANCE:-$DEFAULT_INSTANCE}"
+    echo "$PG_URL|${JOB_NAME}|${INSTANCE}"
   else
-    echo -e "${RED}脚本不存在: $p${NC}"
+    echo "$PG_URL|$JOB|$INST"
   fi
 }
-install_monitor(){ # 原“安装流量监控”
-  echo -e "${CYAN}正在安装流量监控（原脚本）...${NC}"
-  install_script "trafficcop.sh" "traffic_monitor.sh"
-  run_script "$WORK_DIR/traffic_monitor.sh"
-  echo -e "${GREEN}流量监控安装完成！${NC}"
-  read -r -p "按回车继续..." _ || true
-}
-install_tg_notifier(){
-  echo -e "${CYAN}安装 Telegram 通知...${NC}"
-  install_script "tg_notifier.sh"
-  run_script "$WORK_DIR/tg_notifier.sh"
-  echo -e "${GREEN}Telegram 通知安装完成${NC}"
-  read -r -p "按回车继续..." _ || true
-}
-install_pushplus_notifier(){
-  echo -e "${CYAN}安装 PushPlus 通知...${NC}"
-  install_script "pushplus_notifier.sh"
-  run_script "$WORK_DIR/pushplus_notifier.sh"
-  echo -e "${GREEN}PushPlus 通知安装完成${NC}"
-  read -r -p "按回车继续..." _ || true
-}
-install_serverchan_notifier(){
-  echo -e "${CYAN}安装 Server酱 通知...${NC}"
-  if curl -s --head "$REPO_URL/serverchan_notifier.sh" | grep -q "HTTP/2 200\|HTTP/1.1 200"; then
-    install_script "serverchan_notifier.sh"
-    run_script "$WORK_DIR/serverchan_notifier.sh"
-    echo -e "${GREEN}Server酱 通知安装完成${NC}"
+
+clear_pushgateway() {
+  local cfg; cfg="$(read_env_effective)"
+  local PG_URL JOB INSTANCE
+  PG_URL="$(echo "$cfg" | cut -d'|' -f1)"
+  JOB="$(echo "$cfg" | cut -d'|' -f2)"
+  INSTANCE="$(echo "$cfg" | cut -d'|' -f3)"
+
+  log "Will clear Pushgateway for instance: ${INSTANCE} (job=${JOB}) at ${PG_URL}"
+
+  if confirm "DELETE metrics for job=${JOB}, instance=${INSTANCE}?"; then
+    curl -fsS -X DELETE "${PG_URL%/}/metrics/job/${JOB}/instance/${INSTANCE}" && log "Cleared job=${JOB}, instance=${INSTANCE}"
   else
-    echo -e "${YELLOW}[WARN] 仓库没有 serverchan_notifier.sh，跳过${NC}"
-  fi
-  read -r -p "按回车继续..." _ || true
-}
-remove_traffic_limit(){
-  echo -e "${CYAN}解除流量限速...${NC}"
-  install_script "remove_traffic_limit.sh"
-  run_script "$WORK_DIR/remove_traffic_limit.sh"
-  echo -e "${GREEN}已解除限速${NC}"
-  read -r -p "按回车继续..." _ || true
-}
-view_logs(){
-  echo -e "${CYAN}查看日志${NC}"
-  echo "1) 流量监控日志"
-  echo "2) Telegram 通知日志"
-  echo "3) PushPlus 通知日志"
-  echo "4) Server酱 通知日志"
-  echo "0) 返回"
-  read -r -p "选择 [0-4]: " c
-  case "$c$" in
-    1) [ -f "$WORK_DIR/traffic_monitor.log" ] && tail -n 30 "$WORK_DIR/traffic_monitor.log" || echo -e "${RED}无日志${NC}" ;;
-    2) [ -f "$WORK_DIR/tg_notifier_cron.log" ] && tail -n 30 "$WORK_DIR/tg_notifier_cron.log" || echo -e "${RED}无日志${NC}" ;;
-    3) [ -f "$WORK_DIR/pushplus_notifier_cron.log" ] && tail -n 30 "$WORK_DIR/pushplus_notifier_cron.log" || echo -e "${RED}无日志${NC}" ;;
-    4) [ -f "$WORK_DIR/serverchan_notifier_cron.log" ] && tail -n 30 "$WORK_DIR/serverchan_notifier_cron.log" || echo -e "${RED}无日志${NC}" ;;
-  esac
-  read -r -p "按回车继续..." _ || true
-}
-view_config(){
-  echo -e "${CYAN}查看当前配置${NC}"
-  echo "1) 流量监控"
-  echo "2) Telegram 通知"
-  echo "3) PushPlus 通知"
-  echo "4) Server酱 通知"
-  echo "0) 返回"
-  read -r -p "选择 [0-4]: " c
-  case "$c" in
-    1) [ -f "$WORK_DIR/traffic_monitor_config.txt" ] && cat "$WORK_DIR/traffic_monitor_config.txt" || echo -e "${RED}无配置${NC}" ;;
-    2) [ -f "$WORK_DIR/tg_notifier_config.txt" ] && cat "$WORK_DIR/tg_notifier_config.txt" || echo -e "${RED}无配置${NC}" ;;
-    3) [ -f "$WORK_DIR/pushplus_notifier_config.txt" ] && cat "$WORK_DIR/pushplus_notifier_config.txt" || echo -e "${RED}无配置${NC}" ;;
-    4) [ -f "$WORK_DIR/serverchan_notifier_config.txt" ] && cat "$WORK_DIR/serverchan_notifier_config.txt" || echo -e "${RED}无配置${NC}" ;;
-  esac
-  read -r -p "按回车继续..." _ || true
-}
-use_preset_config(){
-  echo -e "${CYAN}使用预设配置${NC}"
-  cat <<'EOP'
-1) 阿里云CDT 200G     2) 阿里云CDT 20G     3) 阿里云轻量 1T
-4) Azure 学生 15G     5) Azure 学生 115G   6) GCP 625G
-7) GCP 200G           8) Alice 1500G       9) 亚洲云 300G
-0) 返回
-EOP
-  read -r -p "选择 [0-9]: " c
-  case "$c" in
-    1) curl -fsSL -o "$WORK_DIR/traffic_monitor_config.txt" "$REPO_URL/ali-200g" ;;
-    2) curl -fsSL -o "$WORK_DIR/traffic_monitor_config.txt" "$REPO_URL/ali-20g" ;;
-    3) curl -fsSL -o "$WORK_DIR/traffic_monitor_config.txt" "$REPO_URL/ali-1T" ;;
-    4) curl -fsSL -o "$WORK_DIR/traffic_monitor_config.txt" "$REPO_URL/az-15g" ;;
-    5) curl -fsSL -o "$WORK_DIR/traffic_monitor_config.txt" "$REPO_URL/az-115g" ;;
-    6) curl -fsSL -o "$WORK_DIR/traffic_monitor_config.txt" "$REPO_URL/GCP-625g" ;;
-    7) curl -fsSL -o "$WORK_DIR/traffic_monitor_config.txt" "$REPO_URL/GCP-200g" ;;
-    8) curl -fsSL -o "$WORK_DIR/traffic_monitor_config.txt" "$REPO_URL/alice-1500g" ;;
-    9) curl -fsSL -o "$WORK_DIR/traffic_monitor_config.txt" "$REPO_URL/asia-300g" ;;
-    0) return ;;
-    *) echo -e "${RED}无效选择${NC}" ;;
-  esac
-  [ -f "$WORK_DIR/traffic_monitor_config.txt" ] && cat "$WORK_DIR/traffic_monitor_config.txt" || true
-  read -r -p "按回车继续..." _ || true
-}
-stop_all_services(){
-  echo -e "${CYAN}停止所有 TrafficCop 相关服务...${NC}"
-  pkill -f traffic_monitor.sh 2>/dev/null || true
-  pkill -f tg_notifier.sh 2>/dev/null || true
-  pkill -f pushplus_notifier.sh 2>/dev/null || true
-  pkill -f serverchan_notifier.sh 2>/dev/null || true
-  crontab -l | grep -v -E "traffic_monitor.sh|tg_notifier.sh|pushplus_notifier.sh|serverchan_notifier.sh" | crontab - || true
-  echo -e "${GREEN}已停止${NC}"; read -r -p "按回车继续..." _ || true
-}
-
-# ====== 原管理器菜单（增加了第9项：Agent 管理） ======
-show_main_menu(){
-  clear
-  echo -e "${PURPLE}================ TrafficCop 管理工具 ================${NC}"
-  echo -e "${YELLOW}1) 安装流量监控${NC}"
-  echo -e "${YELLOW}2) 安装 Telegram 通知${NC}"
-  echo -e "${YELLOW}3) 安装 PushPlus 通知${NC}"
-  echo -e "${YELLOW}4) 安装 Server酱 通知${NC}"
-  echo -e "${YELLOW}5) 解除流量限制${NC}"
-  echo -e "${YELLOW}6) 查看日志${NC}"
-  echo -e "${YELLOW}7) 查看当前配置${NC}"
-  echo -e "${YELLOW}8) 使用预设配置${NC}"
-  echo -e "${YELLOW}9) 安装/管理 Pushgateway Agent（新增）${NC}"
-  echo -e "${YELLOW}0) 退出${NC}"
-  echo -e "${PURPLE}====================================================${NC}"
-  echo ""
-}
-
-# ========= Pushgateway Agent（新增部分） =========
-trim(){ sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//'; }
-pick_config(){ for p in "${CONFIG_FILE_CANDIDATES[@]}"; do [ -f "$p" ] && { echo "$p"; return; }; done; echo ""; }
-from_cfg(){ local re="$1" v c; c="$(pick_config)"; [ -n "$c" ] || { echo ""; return; }
-  v="$(grep -E "$re" "$c" 2>/dev/null | head -n1 | sed 's/^[#[:space:]]*//' | awk -F'[=:]' '{print $2}' | tr -d "\"'" | trim || true)"; echo "$v"; }
-detect_iface(){ local v; v="$(from_cfg '(IFACE|iface|网卡)')"; [ -n "$v" ] || v="$(ip route 2>/dev/null | awk '/default/ {print $5; exit}')"; echo "${v:-eth0}"; }
-detect_instance(){ local v; v="$(from_cfg '(HOSTNAME_ALIAS|HOST_NAME|HOSTNAME|ALIAS|alias|别名|主机名)')"; [ -n "$v" ] || v="$(hostname -s 2>/dev/null || hostname 2>/dev/null || echo unknown)"; echo "$v"; }
-parse_quota_bytes(){ local raw unit num bytes; raw="$(from_cfg '(LIMIT|QUOTA|上限|限制|配额)')" || true
-  [ -n "$raw" ] || { echo 0; return; }
-  raw="$(echo "$raw" | tr '[:lower:]' '[:upper:]' | tr -d ' ')"
-  num="$(echo "$raw" | grep -oE '[0-9]+(\.[0-9]+)?' | head -n1)"
-  unit="$(echo "$raw" | grep -oE '(TB|T|GB|G|MB|M|KB|K|B)$' | head -n1)"
-  [ -n "$num" ] || { echo 0; return; }
-  case "$unit" in
-    TB|T) bytes=$(awk -v n="$num" 'BEGIN{printf "%.0f", n*1024*1024*1024*1024}') ;;
-    GB|G|"") bytes=$(awk -v n="$num" 'BEGIN{printf "%.0f", n*1024*1024*1024}') ;;
-    MB|M) bytes=$(awk -v n="$num" 'BEGIN{printf "%.0f", n*1024*1024}') ;;
-    KB|K) bytes=$(awk -v n="$num" 'BEGIN{printf "%.0f", n*1024}') ;;
-    B) bytes=$(awk -v n="$num" 'BEGIN{printf "%.0f", n}') ;;
-    *) bytes=0 ;;
-  esac
-  echo "${bytes:-0}"
-}
-
-write_agent(){
-  echo -e "${GREEN}[Agent] 写入 $AGENT_DIR/agent.sh${NC}"
-  mkdir -p "$AGENT_DIR"
-  cat > "$AGENT_DIR/agent.sh" <<"EOS"
-#!/usr/bin/env bash
-set -Eeuo pipefail 2>/dev/null || set -Eeuo
-(set -o pipefail) 2>/dev/null || true
-
-: "${ENV_FILE:=/etc/trafficcop-agent.env}"
-[ -f "$ENV_FILE" ] && . "$ENV_FILE"
-
-: "${PG_URL:?缺少 PG_URL}"
-: "${JOB_NAME:=trafficcop}"
-: "${PUSH_INTERVAL:=10}"
-: "${CONFIG_FILE:=/root/TrafficCop/traffic_monitor_config.txt}"
-
-trim(){ sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//'; }
-from_cfg(){ local re="$1" v; [ -f "$CONFIG_FILE" ] || { echo ""; return; }
-  v="$(grep -E "$re" "$CONFIG_FILE" 2>/dev/null | head -n1 | sed 's/^[#[:space:]]*//' | awk -F'[=:]' '{print $2}' | tr -d "\"'" | trim || true)"; echo "$v"; }
-detect_iface(){ local v; v="$(from_cfg '(IFACE|iface|网卡)')"; [ -n "$v" ] || v="$(ip route 2>/dev/null | awk '/default/ {print $5; exit}')"; echo "${v:-eth0}"; }
-detect_instance(){ local v; v="$(from_cfg '(HOSTNAME_ALIAS|HOST_NAME|HOSTNAME|ALIAS|alias|别名|主机名)')"; [ -n "$v" ] || v="$(hostname -s 2>/dev/null || hostname 2>/dev/null || echo unknown)"; echo "$v"; }
-parse_quota(){ local raw unit num bytes; raw="$(from_cfg '(LIMIT|QUOTA|上限|限制|配额)')" || true
-  [ -n "$raw" ] || { echo 0; return; }
-  raw="$(echo "$raw" | tr '[:lower:]' '[:upper:]' | tr -d ' ')"
-  num="$(echo "$raw" | grep -oE '[0-9]+(\.[0-9]+)?' | head -n1)"
-  unit="$(echo "$raw" | grep -oE '(TB|T|GB|G|MB|M|KB|K|B)$' | head -n1)"
-  [ -n "$num" ] || { echo 0; return; }
-  case "$unit" in
-    TB|T) bytes=$(awk -v n="$num" 'BEGIN{printf "%.0f", n*1024*1024*1024*1024}') ;;
-    GB|G|"") bytes=$(awk -v n="$num" 'BEGIN{printf "%.0f", n*1024*1024*1024}') ;;
-    MB|M) bytes=$(awk -v n="$num" 'BEGIN{printf "%.0f", n*1024*1024}') ;;
-    KB|K) bytes=$(awk -v n="$num" 'BEGIN{printf "%.0f", n*1024}') ;;
-    B) bytes=$(awk -v n="$num" 'BEGIN{printf "%.0f", n}') ;;
-    *) bytes=0 ;;
-  esac; echo "${bytes:-0}"
-}
-
-push_once(){
-  local iface="$1" instance="$2" quota="$3"
-  local rx tx; rx="$(cat /sys/class/net/"$iface"/statistics/rx_bytes 2>/dev/null || echo 0)"
-  tx="$(cat /sys/class/net/"$iface"/statistics/tx_bytes 2>/dev/null || echo 0)"
-
-  local month_rx=0 month_tx=0
-  if command -v vnstat >/dev/null 2>&1; then
-    read -r month_rx month_tx < <(vnstat --json 2>/dev/null | jq -r --arg IF "$iface" \
-      '.interfaces[] | select(.name==$IF) | .traffic.months[0] // {} | "\(.rx*1024) \(.tx*1024)"' 2>/dev/null || echo "0 0")
+    log "Skipped instance delete."
   fi
 
-  cat >/tmp/trafficcop_metrics.txt <<METRICS
-# TYPE traffic_rx_bytes_total counter
-traffic_rx_bytes_total{job="$JOB_NAME",instance="$instance",iface="$iface"} $rx
-# TYPE traffic_tx_bytes_total counter
-traffic_tx_bytes_total{job="$JOB_NAME",instance="$instance",iface="$iface"} $tx
-# TYPE traffic_month_rx_bytes gauge
-traffic_month_rx_bytes{job="$JOB_NAME",instance="$instance",iface="$iface"} ${month_rx:-0}
-# TYPE traffic_month_tx_bytes gauge
-traffic_month_tx_bytes{job="$JOB_NAME",instance="$instance",iface="$iface"} ${month_tx:-0}
-# TYPE traffic_node_quota_bytes gauge
-traffic_node_quota_bytes{job="$JOB_NAME",instance="$instance"} ${quota:-0}
-# TYPE traffic_agent_up gauge
-traffic_agent_up{job="$JOB_NAME",instance="$instance"} 1
-METRICS
-
-  curl -fsS --retry 2 --data-binary @/tmp/trafficcop_metrics.txt \
-    "$PG_URL/metrics/job/$JOB_NAME/instance/${instance//[ \/]/_}"
+  if confirm "ALSO delete the entire job=${JOB} (all instances)?"; then
+    curl -fsS -X DELETE "${PG_URL%/}/metrics/job/${JOB}" && log "Cleared entire job=${JOB}"
+  else
+    log "Skipped whole-job delete."
+  fi
 }
 
-main(){
-  local iface="${IFACE_OVERRIDE:-$(detect_iface)}"
-  local instance="${INSTANCE_OVERRIDE:-$(detect_instance)}"
-  local quota="${QUOTA_BYTES_OVERRIDE:-$(parse_quota)}"
-  while true; do push_once "$iface" "$instance" "$quota" || true; sleep "${PUSH_INTERVAL}"; done
-}
-main
-EOS
-  chmod +x "$AGENT_DIR/agent.sh"
-}
-
-write_env(){
-  echo -e "${GREEN}[Agent] 写入环境: $ENV_FILE${NC}"
-  local IFACE DETECT_INSTANCE QUOTA
-  IFACE="$(detect_iface)"; DETECT_INSTANCE="$(detect_instance)"; QUOTA="$(parse_quota_bytes)"
-  cat > "$ENV_FILE" <<EOF
-PG_URL="$PG_URL"
-JOB_NAME="$JOB_NAME"
-PUSH_INTERVAL="$PUSH_INTERVAL"
-CONFIG_FILE="$(pick_config || echo /root/TrafficCop/traffic_monitor_config.txt)"
-
-# 自动探测（可手动覆盖）
-IFACE_OVERRIDE="$IFACE"
-INSTANCE_OVERRIDE="$DETECT_INSTANCE"
-QUOTA_BYTES_OVERRIDE="$QUOTA"
+write_env_file() {
+  cat >"$ENV_FILE" <<EOF
+# Environment for trafficcop-agent
+# You can edit and 'systemctl restart trafficcop-agent' to apply.
+PG_URL="${DEFAULT_PG_URL}"
+JOB_NAME="${DEFAULT_JOB_NAME}"
+INSTANCE="${DEFAULT_INSTANCE}"
+PUSH_INTERVAL="${DEFAULT_PUSH_INTERVAL}"
+CURL_TIMEOUT="${DEFAULT_CURL_TIMEOUT}"
+IFACES="${DEFAULT_IFACES}"      # AUTO | "*" | "eth0 ens3 ..." (space separated)
+RUN_DIR="${DEFAULT_RUN_DIR}"
+METRICS_PATH="${DEFAULT_METRICS_PATH}"
+LOG_LEVEL="${DEFAULT_LOG_LEVEL}"
 EOF
+  chmod 0644 "$ENV_FILE"
 }
 
-write_service(){
-  echo -e "${GREEN}[Agent] 注册常驻（systemd优先，失败用cron兜底）${NC}"
-  cat > "/etc/systemd/system/$SERVICE_NAME" <<EOF
+write_agent_script() {
+  cat >"$AGENT_BIN" <<'EOS'
+#!/usr/bin/env bash
+# /opt/trafficcop-agent/agent.sh
+# AGENT_VERSION=2.0-stable
+set -Eeuo pipefail
+
+# Load env (with fallbacks)
+ENV_FILE="/etc/trafficcop-agent.env"
+[[ -f "$ENV_FILE" ]] && . "$ENV_FILE"
+
+PG_URL="${PG_URL:-http://127.0.0.1:9091}"
+JOB_NAME="${JOB_NAME:-trafficcop}"
+INSTANCE="${INSTANCE:-$(hostname -f 2>/dev/null || hostname)}"
+PUSH_INTERVAL="${PUSH_INTERVAL:-10}"
+CURL_TIMEOUT="${CURL_TIMEOUT:-5}"
+IFACES="${IFACES:-AUTO}"
+RUN_DIR="${RUN_DIR:-/run/trafficcop}"
+METRICS_PATH="${METRICS_PATH:-${RUN_DIR}/metrics.prom}"
+LOG_LEVEL="${LOG_LEVEL:-info}"
+
+log() {
+  local lvl="$1"; shift
+  if [[ "$lvl" == "error" ]] || [[ "$LOG_LEVEL" == "debug" ]] || [[ "$lvl" == "info" ]]; then
+    echo "[$(date +'%F %T')] [$lvl] $*"
+  fi
+}
+
+cleanup() {
+  log info "Exiting, cleaning up..."
+  exit 0
+}
+trap cleanup INT TERM
+
+ensure_dirs() {
+  install -d -m 755 "$RUN_DIR"
+}
+
+list_ifaces() {
+  local ret=()
+  if [[ "$IFACES" == "AUTO" ]]; then
+    # 默认选择默认路由的出接口 + 其他UP的非lo接口
+    local def; def="$(ip route 2>/dev/null | awk '/^default/ {print $5; exit}')" || true
+    [[ -n "$def" ]] && ret+=("$def")
+    while IFS= read -r name; do
+      [[ "$name" == "lo" ]] && continue
+      ret+=("$name")
+    done < <(ip -o link show up 2>/dev/null | awk -F': ' '{print $2}')
+  elif [[ "$IFACES" == "*" ]]; then
+    while IFS= read -r name; do
+      [[ "$name" == "lo" ]] && continue
+      ret+=("$name")
+    done < <(ls -1 /sys/class/net 2>/dev/null || true)
+  else
+    # space-separated list
+    read -r -a ret <<<"$IFACES"
+  fi
+  printf '%s\n' "${ret[@]}" | awk 'NF' | sort -u
+}
+
+iface_up() {
+  local ifc="$1"
+  local state_file="/sys/class/net/${ifc}/operstate"
+  [[ -r "$state_file" ]] || { echo 0; return; }
+  local st; st="$(cat "$state_file" 2>/dev/null || echo "down")"
+  [[ "$st" == "up" ]] && echo 1 || echo 0
+}
+
+read_stat() {
+  # $1=iface $2=rx|tx
+  local file="/sys/class/net/$1/statistics/${2}_bytes"
+  [[ -r "$file" ]] && cat "$file" || echo 0
+}
+
+write_metrics_once() {
+  local tmp="${METRICS_PATH}.tmp"
+  : > "$tmp"
+
+  printf '# HELP traffic_rx_bytes_total Total received bytes per interface.\n' >>"$tmp"
+  printf '# TYPE traffic_rx_bytes_total counter\n' >>"$tmp"
+  printf '# HELP traffic_tx_bytes_total Total transmitted bytes per interface.\n' >>"$tmp"
+  printf '# TYPE traffic_tx_bytes_total counter\n' >>"$tmp"
+  printf '# HELP traffic_iface_up Interface link state (1=up, 0=down).\n' >>"$tmp"
+  printf '# TYPE traffic_iface_up gauge\n' >>"$tmp"
+
+  local ifaces; ifaces=($(list_ifaces))
+  for ifc in "${ifaces[@]}"; do
+    local rx tx up
+    rx="$(read_stat "$ifc" rx)"
+    tx="$(read_stat "$ifc" tx)"
+    up="$(iface_up "$ifc")"
+    # Labels: instance & iface
+    printf 'traffic_rx_bytes_total{instance="%s",iface="%s"} %s\n' "$INSTANCE" "$ifc" "$rx" >>"$tmp"
+    printf 'traffic_tx_bytes_total{instance="%s",iface="%s"} %s\n' "$INSTANCE" "$ifc" "$tx" >>"$tmp"
+    printf 'traffic_iface_up{instance="%s",iface="%s"} %s\n' "$INSTANCE" "$ifc" "$up" >>"$tmp"
+  done
+
+  # Atomic move
+  mv -f "$tmp" "$METRICS_PATH"
+}
+
+push_metrics() {
+  local url="${PG_URL%/}/metrics/job/${JOB_NAME}/instance/${INSTANCE}"
+  # Pushgateway expects PUT or POST; we use PUT to replace group
+  local code
+  code="$(curl -sS -m "${CURL_TIMEOUT}" -o /dev/stderr -w '%{http_code}' \
+    -X PUT --data-binary @"${METRICS_PATH}" "${url}" || true)"
+  if [[ "$code" != "200" && "$code" != "202" ]]; then
+    log error "Pushgateway returned HTTP $code for ${url}"
+  else
+    log debug "Pushed OK to ${url}"
+  fi
+}
+
+main_loop() {
+  ensure_dirs
+  log info "Agent started (JOB=${JOB_NAME}, INSTANCE=${INSTANCE}, PG=${PG_URL}, INTERVAL=${PUSH_INTERVAL}, IFACES=${IFACES})"
+  while true; do
+    write_metrics_once
+    push_metrics
+    sleep "${PUSH_INTERVAL}"
+  done
+}
+
+main_loop
+EOS
+  chmod 0755 "$AGENT_BIN"
+}
+
+write_service_unit() {
+  cat >"$SERVICE_FILE" <<EOF
+# $SERVICE_FILE
 [Unit]
 Description=TrafficCop Pushgateway Agent
 After=network-online.target
 Wants=network-online.target
+
 [Service]
+Type=simple
 User=root
-EnvironmentFile=$ENV_FILE
-ExecStart=$AGENT_DIR/agent.sh
+EnvironmentFile=-$ENV_FILE
+ExecStart=/opt/trafficcop-agent/agent.sh
 Restart=always
 RestartSec=5
+
 [Install]
 WantedBy=multi-user.target
 EOF
-  systemctl daemon-reload >/dev/null 2>&1 || true
-  if ! systemctl enable --now "$SERVICE_NAME" >/dev/null 2>&1; then
-    echo -e "${YELLOW}[WARN] systemd 不可用/失败，启用 cron @reboot 兜底${NC}"
-    echo "@reboot root nohup $AGENT_DIR/agent.sh >/var/log/trafficcop-agent.log 2>&1 &" >/etc/cron.d/trafficcop-agent
-    nohup "$AGENT_DIR/agent.sh" >/var/log/trafficcop-agent.log 2>&1 & disown
-    service cron restart 2>/dev/null || systemctl restart cron 2>/dev/null || true
-  fi
+  chmod 0644 "$SERVICE_FILE"
 }
 
-show_status(){
-  hr
-  systemctl status "$SERVICE_NAME" --no-pager -n 20 2>/dev/null || echo "(可能在用 cron 兜底)"
-  hr
-  echo "ENV : $ENV_FILE"; [ -f "$ENV_FILE" ] && cat "$ENV_FILE" || true
-  echo "UNIT: /etc/systemd/system/$SERVICE_NAME"; ls -l "/etc/systemd/system/$SERVICE_NAME" 2>/dev/null || true
-  echo "AGENT: $AGENT_DIR/agent.sh"; ls -l "$AGENT_DIR/agent.sh" 2>/dev/null || true
-  hr
-  local HN; HN="$(hostname -s || echo unknown)"
-  echo "Pushgateway 快速检查（匹配本机：$HN）"
-  curl -fsSL "$PG_URL/metrics" | grep -E '^traffic_(rx|tx)_bytes_total' | grep -i "$HN" | head -n 3 || echo "(稍等十秒再刷新 Grafana)"
+install_or_overwrite() {
+  log "Installing (fresh) ..."
+  stop_disable_service || true
+  remove_old_cron || true
+  remove_files || true   # ensure full wipe
+  ensure_dirs
+  write_env_file
+  write_agent_script
+  write_service_unit
+  systemctl daemon-reload
+  systemctl enable "$UNIT_NAME"
+  systemctl start "$UNIT_NAME"
+  sleep 2
+  systemctl --no-pager --full status "$UNIT_NAME" || true
 }
 
-uninstall_agent(){
-  echo -e "${YELLOW}[Agent] 卸载...${NC}"
-  systemctl disable --now "$SERVICE_NAME" 2>/dev/null || true
-  rm -f "/etc/systemd/system/$SERVICE_NAME"; systemctl daemon-reload 2>/dev/null || true
-  rm -f /etc/cron.d/trafficcop-agent
-  pkill -f "$AGENT_DIR/agent.sh" 2>/dev/null || true
-  rm -rf "$AGENT_DIR" "$ENV_FILE"
-  echo -e "${GREEN}[Agent] 卸载完成${NC}"
+self_check() {
+  local cfg; cfg="$(read_env_effective)"
+  local PG_URL JOB INSTANCE
+  PG_URL="$(echo "$cfg" | cut -d'|' -f1)"
+  JOB="$(echo "$cfg" | cut -d'|' -f2)"
+  INSTANCE="$(echo "$cfg" | cut -d'|' -f3)"
+
+  log "Self-check: querying ${PG_URL}/metrics for '^traffic_' (job=${JOB}, instance=${INSTANCE}) ..."
+  # 优先只看该 job/instance 的 endpoint，减少干扰
+  curl -fsS "${PG_URL%/}/metrics" | grep -E '^traffic_' | head -n 20 || {
+    log "No '^traffic_' lines found yet. The service may need a few seconds. Tail journal:"
+    journalctl -u "$UNIT_NAME" -n 30 --no-pager || true
+  }
 }
 
-menu_agent(){
-  while true; do
-    clear
-    echo -e "${PURPLE}===== Pushgateway Agent 管理 =====${NC}"
-    echo "1) 安装/重装 Agent"
-    echo "2) 查看状态"
-    echo "3) 卸载 Agent"
-    echo "0) 返回主菜单"
-    read -r -p "选择 [0-3]: " a
-    case "$a" in
-      1) install_deps; write_agent; write_env; write_service; show_status ;;
-      2) show_status ;;
-      3) uninstall_agent ;;
-      0) break ;;
-      *) echo "无效选择" ;;
+uninstall_all() {
+  log "Uninstalling ..."
+  stop_disable_service || true
+  remove_old_cron || true
+  remove_files || true
+  log "Uninstalled. To remove metrics from Pushgateway, run with --clear-pg."
+}
+
+# ===== Main =====
+need_root
+
+EXISTING="$(detect_existing)"
+
+ACTION=""
+if [[ "$FLAG_UNINSTALL" == "true" ]]; then
+  ACTION="U"
+elif [[ "$FLAG_OVERWRITE" == "true" ]]; then
+  ACTION="O"
+elif [[ "$FLAG_KEEP" == "true" ]]; then
+  ACTION="K"
+fi
+
+if [[ -z "$ACTION" ]]; then
+  if [[ "$EXISTING" == "true" ]]; then
+    echo "Detected existing TrafficCop agent on this host."
+    echo "[O]verwrite (fresh install)  [K]eep (do nothing)  [U]ninstall"
+    read -r -p "Choose action [O/K/U]: " ans || true
+    case "${ans^^}" in
+      O) ACTION="O" ;;
+      K) ACTION="K" ;;
+      U) ACTION="U" ;;
+      *) echo "No valid choice, abort."; exit 1;;
     esac
-    read -r -p "按回车继续..." _ || true
-  done
-}
+  else
+    ACTION="O"
+  fi
+fi
 
-# ============= 顶层命令 =============
-cmd_install(){ check_root; install_deps; create_work_dir; install_monitor; write_agent; write_env; write_service; show_status; }
-cmd_menu(){ check_root; create_work_dir; while true; do show_main_menu; read -r -p "请选择 [0-9]: " ch; case "$ch" in
-  1) install_monitor ;;
-  2) install_tg_notifier ;;
-  3) install_pushplus_notifier ;;
-  4) install_serverchan_notifier ;;
-  5) remove_traffic_limit ;;
-  6) view_logs ;;
-  7) view_config ;;
-  8) use_preset_config ;;
-  9) menu_agent ;;
-  0) echo -e "${GREEN}Bye${NC}"; exit 0 ;;
-  *) echo -e "${RED}无效选择${NC}" ;;
-esac; done; }
-cmd_agent_only(){ check_root; install_deps; write_agent; write_env; write_service; show_status; }
-cmd_status(){ show_status; }
-
-case "${1:-install}" in
-  install) cmd_install ;;
-  menu) cmd_menu ;;
-  agent-only) cmd_agent_only ;;
-  uninstall-agent) uninstall_agent ;;
-  status) cmd_status ;;
-  *) echo "用法: $0 [install|menu|agent-only|uninstall-agent|status]"; exit 1 ;;
+case "$ACTION" in
+  O)
+    install_or_overwrite
+    if [[ "$FLAG_CLEAR_PG" == "true" ]]; then
+      clear_pushgateway || true
+    fi
+    self_check
+    ;;
+  K)
+    log "Keep selected. No changes made."
+    if [[ "$FLAG_CLEAR_PG" == "true" ]]; then
+      clear_pushgateway || true
+    fi
+    ;;
+  U)
+    uninstall_all
+    if [[ "$FLAG_CLEAR_PG" == "true" ]]; then
+      clear_pushgateway || true
+    fi
+    ;;
+  *)
+    die "Unknown action."
+    ;;
 esac
+
+log "Done."
