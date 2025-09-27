@@ -1,3 +1,4 @@
+# AGENT_VERSION=2.0-stable
 #!/usr/bin/env bash
 # trafficcop-manager-merged.sh
 # Robust installer/manager for TrafficCop Pushgateway Agent
@@ -408,3 +409,4 @@ case "$ACTION" in
 esac
 
 log "Done."
+
