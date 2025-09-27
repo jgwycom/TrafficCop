@@ -1,14 +1,12 @@
-# AGENT_VERSION=2.2-stable
+# AGENT_VERSION=2.3-stable
 #!/usr/bin/env bash
 # trafficcop-manager-merged.sh
-# Robust installer/manager for TrafficCop Pushgateway Agent
-# 关键修复：不再在指标里写入 instance=label，避免与 Pushgateway 分组键冲突导致 400。
-# 其他：强制交互式 INSTANCE 输入与校验、自动清理、LC_ALL=C 输出、严格从 env 读取配置。
+# 全新版本：彻底修复 Pushgateway HTTP 400 / instance label 冲突问题
 
 set -Eeuo pipefail
 
 # ===== Default Configs =====
-DEFAULT_PG_URL="${PG_URL:-http://127.0.0.1:9091}"   # 允许通过环境变量 PG_URL 预置，否则默认本地
+DEFAULT_PG_URL="${PG_URL:-http://127.0.0.1:9091}"
 DEFAULT_JOB_NAME="trafficcop"
 DEFAULT_PUSH_INTERVAL="10"
 DEFAULT_CURL_TIMEOUT="5"
@@ -22,7 +20,6 @@ AGENT_DIR="/opt/trafficcop-agent"
 AGENT_BIN="${AGENT_DIR}/agent.sh"
 ENV_FILE="/etc/trafficcop-agent.env"
 SERVICE_FILE="/etc/systemd/system/trafficcop-agent.service"
-CRON_FILE="/etc/cron.d/trafficcop-agent"
 UNIT_NAME="trafficcop-agent.service"
 
 # ===== CLI Flags =====
@@ -61,21 +58,8 @@ log() { echo "[$(date +'%F %T')] $*"; }
 die() { echo "ERROR: $*" >&2; exit 1; }
 need_root() { [[ ${EUID:-$(id -u)} -eq 0 ]] || die "Please run as root (sudo -i)."; }
 
-svc_is_installed() { [[ -f "$SERVICE_FILE" ]] || systemctl list-unit-files | grep -q "^trafficcop-agent\.service"; }
-ensure_dirs() { install -d -m 755 "$AGENT_DIR" "$DEFAULT_RUN_DIR"; }
-
 stop_disable_service() { systemctl stop "$UNIT_NAME" 2>/dev/null || true; systemctl disable "$UNIT_NAME" 2>/dev/null || true; }
-remove_old_cron() { rm -f "$CRON_FILE" 2>/dev/null || true; }
 remove_files() { rm -f "$SERVICE_FILE" "$ENV_FILE" || true; rm -rf "$AGENT_DIR" || true; systemctl daemon-reload || true; }
-
-detect_existing() {
-  local found="false"
-  [[ -d "$AGENT_DIR" ]] && found="true"
-  svc_is_installed && found="true"
-  [[ -f "$ENV_FILE" ]] && found="true"
-  [[ -f "$CRON_FILE" ]] && found="true"
-  echo "$found"
-}
 
 confirm() {
   local prompt="$1"
@@ -99,9 +83,7 @@ clear_pushgateway() {
   PG_URL="$(echo "$cfg" | cut -d'|' -f1)"
   JOB="$(echo "$cfg" | cut -d'|' -f2)"
   INSTANCE="$(echo "$cfg" | cut -d'|' -f3)"
-
   log "Clearing Pushgateway (job=${JOB}, instance=${INSTANCE}) at ${PG_URL}"
-  # 先删该实例，再删整个 job，尽量把旧残留一次清空
   curl -fsS -X DELETE "${PG_URL%/}/metrics/job/${JOB}/instance/${INSTANCE}" || true
   curl -fsS -X DELETE "${PG_URL%/}/metrics/job/${JOB}" || true
 }
@@ -112,7 +94,7 @@ ask_instance_name() {
   while true; do
     echo "=============================="
     echo "请输入当前节点的唯一标识 INSTANCE"
-    echo "⚠️  必须全局唯一，只允许字母、数字、点、横杠、下划线"
+    echo "⚠️ 必须全局唯一，只允许字母、数字、点、横杠、下划线"
     echo "示例：node-01, db_02, proxy-kr.03, SzHdy-HK"
     echo "=============================="
     read -r -p "INSTANCE 名称: " ans
@@ -148,22 +130,20 @@ EOF
 write_agent_script() {
   cat >"$AGENT_BIN" <<'EOS'
 #!/usr/bin/env bash
-# AGENT_VERSION=2.2-stable
-# /opt/trafficcop-agent/agent.sh
+# AGENT_VERSION=2.3-stable
 set -Eeuo pipefail
 
 ENV_FILE="/etc/trafficcop-agent.env"
 [[ -f "$ENV_FILE" ]] && . "$ENV_FILE"
 
-PG_URL="${PG_URL:?PG_URL must be set in /etc/trafficcop-agent.env}"
+PG_URL="${PG_URL:?PG_URL must be set}"
 JOB_NAME="${JOB_NAME:-trafficcop}"
-INSTANCE="${INSTANCE:?INSTANCE must be set in /etc/trafficcop-agent.env}"
+INSTANCE="${INSTANCE:?INSTANCE must be set}"
 PUSH_INTERVAL="${PUSH_INTERVAL:-10}"
 CURL_TIMEOUT="${CURL_TIMEOUT:-5}"
 IFACES="${IFACES:-AUTO}"
 RUN_DIR="${RUN_DIR:-/run/trafficcop}"
 METRICS_PATH="${METRICS_PATH:-${RUN_DIR}/metrics.prom}"
-LOG_LEVEL="${LOG_LEVEL:-info}"
 
 log() { echo "[$(date +'%F %T')] [$1] ${*:2}"; }
 
@@ -186,38 +166,35 @@ list_ifaces() {
 write_metrics_once() {
   local tmp="${METRICS_PATH}.tmp"
   : > "$tmp"
-
-  LC_ALL=C printf '# HELP traffic_rx_bytes_total Total received bytes per interface.\n# TYPE traffic_rx_bytes_total counter\n' >>"$tmp"
-  LC_ALL=C printf '# HELP traffic_tx_bytes_total Total transmitted bytes per interface.\n# TYPE traffic_tx_bytes_total counter\n' >>"$tmp"
-  LC_ALL=C printf '# HELP traffic_iface_up Interface link state (1=up,0=down).\n# TYPE traffic_iface_up gauge\n' >>"$tmp"
+  LC_ALL=C printf '# HELP traffic_rx_bytes_total Total received bytes.\n# TYPE traffic_rx_bytes_total counter\n' >>"$tmp"
+  LC_ALL=C printf '# HELP traffic_tx_bytes_total Total transmitted bytes.\n# TYPE traffic_tx_bytes_total counter\n' >>"$tmp"
+  LC_ALL=C printf '# HELP traffic_iface_up Interface state (1=up,0=down).\n# TYPE traffic_iface_up gauge\n' >>"$tmp"
 
   for ifc in $(list_ifaces); do
     local rx tx up
     rx="$(read_stat "$ifc" rx)"
     tx="$(read_stat "$ifc" tx)"
     up="$(iface_up "$ifc")"
-    # ⚠️ 不要写 instance=label；Pushgateway 会自动加 job/instance（来自 URL 分组键）
+    # 不再写 instance=，由 Pushgateway 自动加
     LC_ALL=C printf 'traffic_rx_bytes_total{iface="%s"} %s\n' "$ifc" "$rx" >>"$tmp"
     LC_ALL=C printf 'traffic_tx_bytes_total{iface="%s"} %s\n' "$ifc" "$tx" >>"$tmp"
     LC_ALL=C printf 'traffic_iface_up{iface="%s"} %s\n' "$ifc" "$up" >>"$tmp"
   done
-
   mv -f "$tmp" "$METRICS_PATH"
 }
 
 push_metrics() {
   local url="${PG_URL%/}/metrics/job/${JOB_NAME}/instance/${INSTANCE}"
-  # 设定 Content-Type，并丢弃响应体避免 curl: (23)
   local code
   code="$(curl -sS -m "${CURL_TIMEOUT}" -o /dev/null -w '%{http_code}' \
     -H 'Content-Type: text/plain; version=0.0.4; charset=utf-8' \
     -X PUT --data-binary @"${METRICS_PATH}" "${url}" || true)"
-  [[ "$code" != "200" && "$code" != "202" ]] && log error "Pushgateway returned HTTP $code for ${url}"
+  [[ "$code" != "200" && "$code" != "202" ]] && log error "Pushgateway returned HTTP $code"
 }
 
 main_loop() {
   ensure_dirs
-  log info "Agent started (JOB=${JOB_NAME}, INSTANCE=${INSTANCE}, PG=${PG_URL}, INTERVAL=${PUSH_INTERVAL}, IFACES=${IFACES})"
+  log info "Agent started (JOB=${JOB_NAME}, INSTANCE=${INSTANCE}, PG=${PG_URL}, INTERVAL=${PUSH_INTERVAL})"
   while true; do write_metrics_once; push_metrics; sleep "${PUSH_INTERVAL}"; done
 }
 
@@ -251,9 +228,8 @@ install_or_overwrite() {
   log "Installing (fresh) ..."
   ask_instance_name
   stop_disable_service || true
-  remove_old_cron || true
   remove_files || true
-  ensure_dirs
+  mkdir -p "$AGENT_DIR" "$DEFAULT_RUN_DIR"
   write_env_file
   write_agent_script
   write_service_unit
@@ -270,27 +246,21 @@ self_check() {
   PG_URL="$(echo "$cfg" | cut -d'|' -f1)"
   JOB="$(echo "$cfg" | cut -d'|' -f2)"
   INSTANCE="$(echo "$cfg" | cut -d'|' -f3)"
-  log "Self-check: querying ${PG_URL}/metrics for '^traffic_' ..."
+  log "Self-check: querying ${PG_URL}/metrics ..."
   curl -fsS "${PG_URL%/}/metrics" | grep -E '^traffic_' | head -n 20 || true
 }
 
-uninstall_all() { log "Uninstalling ..."; stop_disable_service || true; remove_old_cron || true; remove_files || true; }
+uninstall_all() { log "Uninstalling ..."; stop_disable_service || true; remove_files || true; }
 
 # ===== Main =====
 need_root
-EXISTING="$(detect_existing)"
 ACTION=""
 if [[ "$FLAG_UNINSTALL" == "true" ]]; then ACTION="U"
 elif [[ "$FLAG_OVERWRITE" == "true" ]]; then ACTION="O"
 elif [[ "$FLAG_KEEP" == "true" ]]; then ACTION="K"; fi
 
 if [[ -z "$ACTION" ]]; then
-  if [[ "$EXISTING" == "true" ]]; then
-    echo "Detected existing TrafficCop agent."
-    echo "[O]verwrite / [K]eep / [U]uninstall"
-    read -r -p "Choose action [O/K/U]: " ans || true
-    case "${ans^^}" in O) ACTION="O";; K) ACTION="K";; U) ACTION="U";; *) exit 1;; esac
-  else ACTION="O"; fi
+  ACTION="O"
 fi
 
 case "$ACTION" in
