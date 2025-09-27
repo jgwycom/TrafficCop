@@ -1,4 +1,4 @@
-# AGENT_VERSION=2.1-stable
+# AGENT_VERSION=2.2-stable
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
@@ -12,8 +12,6 @@ AGENT_DIR="/opt/trafficcop-agent"
 RUN_DIR="/run/trafficcop"
 METRICS_FILE="${RUN_DIR}/metrics.prom"
 
-# 默认值
-PG_URL_DEFAULT="${PG_URL:-http://127.0.0.1:9091}"
 JOB_DEFAULT="trafficcop"
 INTERVAL_DEFAULT="10"
 IFACES_DEFAULT="AUTO"
@@ -57,15 +55,18 @@ pg_delete_job(){
 }
 
 ### ================================
-### 读取旧版配置（/root/TrafficCop）
+### 迁移助手：读取旧版配置
 ### ================================
 load_old_config(){
   local cfg="/root/TrafficCop/traffic_monitor_config.txt"
   if [[ -f "$cfg" ]]; then
     log "检测到旧版配置 $cfg，尝试读取 ..."
-    RESET_DAY_DEFAULT="$(grep -E '^RESET_DAY=' "$cfg" | cut -d= -f2 || echo 1)"
-    LIMIT_BYTES_DEFAULT="$(grep -E '^LIMIT_BYTES=' "$cfg" | cut -d= -f2 || echo 0)"
-    log "旧版默认：RESET_DAY=$RESET_DAY_DEFAULT, LIMIT_BYTES=$LIMIT_BYTES_DEFAULT"
+    local rd lb
+    rd="$(grep -E '^RESET_DAY=' "$cfg" | cut -d= -f2 || true)"
+    lb="$(grep -E '^LIMIT_BYTES=' "$cfg" | cut -d= -f2 || true)"
+    [[ -n "$rd" ]] && RESET_DAY_DEFAULT="$rd"
+    [[ -n "$lb" ]] && LIMIT_BYTES_DEFAULT="$lb"
+    log "迁移默认值: RESET_DAY=$RESET_DAY_DEFAULT, LIMIT_BYTES=$LIMIT_BYTES_DEFAULT"
   fi
 }
 
@@ -89,14 +90,17 @@ ask_instance(){
 }
 
 ask_pg_url_job_interval(){
-  read -r -p "Pushgateway 地址 [默认 $PG_URL_DEFAULT]: " PG_URL || true
-  PG_URL="${PG_URL:-$PG_URL_DEFAULT}"
+  local p j itf
+  read -r -p "Pushgateway 地址 (必填): " p || true
+  [[ -z "$p" ]] && die "必须提供 Pushgateway 地址，例如 http://123.45.678.90:19091"
+  PG_URL="$p"
 
-  read -r -p "Job 名称 [默认 $JOB_DEFAULT]: " JOB || true
-  JOB="${JOB:-$JOB_DEFAULT}"
+  read -r -p "Job 名称 [默认 $JOB_DEFAULT]: " j || true
+  JOB="${j:-$JOB_DEFAULT}"
 
-  read -r -p "推送间隔秒 [默认 $INTERVAL_DEFAULT]: " INTERVAL || true
-  [[ "$INTERVAL" =~ ^[0-9]+$ ]] || INTERVAL="$INTERVAL_DEFAULT"
+  read -r -p "推送间隔秒 [默认 $INTERVAL_DEFAULT]: " itf || true
+  [[ "$itf" =~ ^[0-9]+$ ]] || itf="$INTERVAL_DEFAULT"
+  INTERVAL="$itf"
 
   IFACES="$IFACES_DEFAULT"
 }
@@ -120,7 +124,7 @@ ask_reset_day_and_limit(){
 ### ================================
 write_env(){
   cat >"$ENV_FILE" <<EOF
-# AGENT_VERSION=2.1-stable
+# AGENT_VERSION=2.2-stable
 PG_URL="$PG_URL"
 JOB="$JOB"
 INSTANCE="$INSTANCE"
@@ -132,6 +136,7 @@ RESET_DAY="$RESET_DAY"
 LIMIT_BYTES="$LIMIT_BYTES"
 EOF
   chmod 644 "$ENV_FILE"
+  log "已写入配置 $ENV_FILE"
 }
 
 write_agent(){
@@ -189,6 +194,7 @@ main(){
 main
 EOS
   chmod 755 "$AGENT_DIR/agent.sh"
+  log "已写入 $AGENT_DIR/agent.sh"
 }
 
 write_service(){
@@ -209,6 +215,7 @@ RestartSec=5
 WantedBy=multi-user.target
 EOF
   systemctl daemon-reload
+  log "已写入 systemd 单元 $SERVICE_FILE"
 }
 
 ### ================================
