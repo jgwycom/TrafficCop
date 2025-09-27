@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# AGENT_VERSION=2.3-final
+# AGENT_VERSION=2.4-final
 set -Eeuo pipefail
 
 log() { echo "[$(date '+%F %T')] $*"; }
@@ -68,14 +68,21 @@ LIMIT_BYTES=$(awk "BEGIN {print (${LIMIT_INPUT:-$LIMIT_BYTES_DEFAULT} * 1024 * 1
 # 网卡选择
 #------------------------------
 AVAILABLE_IFACES=$(ls /sys/class/net | grep -Ev '^(lo|docker.*|veth.*)$')
+DEFAULT_IFACE=""
+if echo "$AVAILABLE_IFACES" | grep -qw "eth0"; then
+  DEFAULT_IFACE="eth0"
+else
+  DEFAULT_IFACE=$(echo "$AVAILABLE_IFACES" | head -n1)
+fi
+
 echo "=============================="
 echo "检测到以下网络接口:"
 echo "$AVAILABLE_IFACES"
 echo "请输入需要监控的接口（可输入多个，以空格分隔）"
-echo "例如: eth0 或 eth0 ens3"
+echo "直接回车则默认使用: $DEFAULT_IFACE"
 echo "=============================="
 read -rp "IFACES: " IFACES_INPUT
-IFACES="${IFACES_INPUT:-eth0}"
+IFACES="${IFACES_INPUT:-$DEFAULT_IFACE}"
 
 #------------------------------
 # 清理 PG 残余
