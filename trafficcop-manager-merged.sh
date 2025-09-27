@@ -2,7 +2,8 @@
 #!/usr/bin/env bash
 # trafficcop-manager-merged.sh
 # Robust installer/manager for TrafficCop Pushgateway Agent
-# Version 2.2-stable (with INSTANCE validation)
+# 强制 INSTANCE 交互输入 + 校验，只认 /etc/trafficcop-agent.env
+
 set -Eeuo pipefail
 
 # ===== Default Configs =====
@@ -83,17 +84,11 @@ confirm() {
 }
 
 read_env_effective() {
-  local PG_URL="$DEFAULT_PG_URL"
-  local JOB="$DEFAULT_JOB_NAME"
-  local INST="UNKNOWN"
   if [[ -f "$ENV_FILE" ]]; then
     . "$ENV_FILE"
-    PG_URL="${PG_URL:-$DEFAULT_PG_URL}"
-    JOB_NAME="${JOB_NAME:-$DEFAULT_JOB_NAME}"
-    INSTANCE="${INSTANCE:-UNKNOWN}"
-    echo "$PG_URL|${JOB_NAME}|${INSTANCE}"
+    echo "${PG_URL}|${JOB_NAME}|${INSTANCE}"
   else
-    echo "$PG_URL|$JOB|$INST"
+    echo "${DEFAULT_PG_URL}|${DEFAULT_JOB_NAME}|UNKNOWN"
   fi
 }
 
@@ -119,8 +114,8 @@ ask_instance_name() {
   while true; do
     echo "=============================="
     echo "请输入当前节点的唯一标识 INSTANCE"
-    echo "⚠️  必须全局唯一，只允许字母、数字、点、横杠、下划线"
-    echo "例如：node-01, db_02, proxy-kr.03"
+    echo "⚠️ 必须全局唯一，只允许字母、数字、点、横杠、下划线"
+    echo "示例：node-01, db_02, proxy-kr.03"
     echo "=============================="
     read -r -p "INSTANCE 名称: " ans
     if [[ -z "$ans" ]]; then
@@ -155,16 +150,16 @@ EOF
 write_agent_script() {
   cat >"$AGENT_BIN" <<'EOS'
 #!/usr/bin/env bash
+# AGENT_VERSION=2.0-stable
 # /opt/trafficcop-agent/agent.sh
-# AGENT_VERSION=2.2-stable
 set -Eeuo pipefail
 
 ENV_FILE="/etc/trafficcop-agent.env"
 [[ -f "$ENV_FILE" ]] && . "$ENV_FILE"
 
-PG_URL="${PG_URL:-http://127.0.0.1:9091}"
+PG_URL="${PG_URL:?PG_URL must be set in /etc/trafficcop-agent.env}"
 JOB_NAME="${JOB_NAME:-trafficcop}"
-INSTANCE="${INSTANCE:?INSTANCE not set in env file}"
+INSTANCE="${INSTANCE:?INSTANCE must be set in /etc/trafficcop-agent.env}"
 PUSH_INTERVAL="${PUSH_INTERVAL:-10}"
 CURL_TIMEOUT="${CURL_TIMEOUT:-5}"
 IFACES="${IFACES:-AUTO}"
@@ -289,7 +284,7 @@ elif [[ "$FLAG_KEEP" == "true" ]]; then ACTION="K"; fi
 if [[ -z "$ACTION" ]]; then
   if [[ "$EXISTING" == "true" ]]; then
     echo "Detected existing TrafficCop agent."
-    echo "[O]verwrite / [K]eep / [U]ninstall"
+    echo "[O]verwrite / [K]eep / [U]uninstall"
     read -r -p "Choose action [O/K/U]: " ans || true
     case "${ans^^}" in O) ACTION="O";; K) ACTION="K";; U) ACTION="U";; *) exit 1;; esac
   else ACTION="O"; fi
