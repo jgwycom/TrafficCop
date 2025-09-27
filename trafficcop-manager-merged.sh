@@ -9,6 +9,7 @@ AGENT_DIR="/opt/trafficcop-agent"
 METRICS_DIR="/run/trafficcop"
 SERVICE_FILE="/etc/systemd/system/trafficcop-agent.service"
 OLD_CONF="/root/TrafficCop/traffic_monitor_config.txt"
+NODE_ID_FILE="/etc/trafficcop-nodeid"
 
 #------------------------------
 # 清理指定 instance
@@ -84,6 +85,33 @@ read -rp "流量配额 (GiB, 0=不限) [默认 $LIMIT_BYTES_DEFAULT]: " LIMIT_IN
 LIMIT_BYTES=$(awk "BEGIN {print (${LIMIT_INPUT:-$LIMIT_BYTES_DEFAULT} * 1024 * 1024 * 1024)}")
 
 #------------------------------
+# 唯一 NODE_ID 处理
+#------------------------------
+if [[ -f "$NODE_ID_FILE" ]]; then
+  NODE_ID=$(cat "$NODE_ID_FILE")
+  log "检测到已有 NODE_ID=$NODE_ID"
+else
+  if [[ -n "${PANEL_API:-}" ]]; then
+    log "向面板机申请新的 NODE_ID..."
+    NODE_ID=$(curl -s -X POST "$PANEL_API/nodes" \
+      -H "Content-Type: application/json" \
+      -d "{\"instance\":\"$INSTANCE\",\"display_name\":\"$INSTANCE\",\"sort_order\":0,\"reset_day\":$RESET_DAY,\"limit_bytes\":$LIMIT_BYTES,\"limit_mode\":\"double\",\"bandwidth_bps\":0}" \
+      | jq -r '.id // empty')
+
+    if [[ -z "$NODE_ID" || "$NODE_ID" == "null" ]]; then
+      log "❌ 获取 NODE_ID 失败，请检查 PANEL_API 设置"
+      exit 1
+    fi
+
+    echo "$NODE_ID" > "$NODE_ID_FILE"
+    log "已分配 NODE_ID=$NODE_ID"
+  else
+    log "⚠️ 未设置 PANEL_API，无法分配 NODE_ID"
+    NODE_ID=0
+  fi
+fi
+
+#------------------------------
 # 网卡选择
 #------------------------------
 AVAILABLE_IFACES=$(ls /sys/class/net | grep -Ev '^(lo|docker.*|veth.*)$')
@@ -121,6 +149,7 @@ INTERVAL=$INTERVAL
 IFACES="$IFACES"
 RESET_DAY=$RESET_DAY
 LIMIT_BYTES=$LIMIT_BYTES
+NODE_ID=$NODE_ID
 EOF
 log "已写入配置 $ENV_FILE"
 
@@ -142,6 +171,8 @@ while true; do
     echo "# TYPE traffic_tx_bytes_total untyped"
     echo "# HELP traffic_iface_up Interface state."
     echo "# TYPE traffic_iface_up untyped"
+    echo "# HELP node_id 永久节点ID"
+    echo "# TYPE node_id gauge"
   } >"$METRICS_DIR/metrics.prom"
 
   for IF in $IFACES; do
@@ -152,6 +183,8 @@ while true; do
     echo "traffic_tx_bytes_total{iface=\"$IF\"} $TX" >>"$METRICS_DIR/metrics.prom"
     echo "traffic_iface_up{iface=\"$IF\"} $STATE" >>"$METRICS_DIR/metrics.prom"
   done
+
+  echo "node_id $NODE_ID" >>"$METRICS_DIR/metrics.prom"
 
   curl -s -X PUT --data-binary @"$METRICS_DIR/metrics.prom" \
     "$PG_URL/metrics/job/$JOB/instance/$INSTANCE" || true
