@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# AGENT_VERSION=2.1-final
+# AGENT_VERSION=2.2-final
 set -Eeuo pipefail
 
 log() { echo "[$(date '+%F %T')] $*"; }
@@ -33,7 +33,6 @@ fi
 #------------------------------
 # 交互输入
 #------------------------------
-# INSTANCE 必填
 echo "=============================="
 echo "请输入当前节点的唯一标识 INSTANCE"
 echo "⚠️ 必须唯一，仅允许字母/数字/点/横杠/下划线"
@@ -93,10 +92,11 @@ cat >"$AGENT_DIR/agent.sh" <<'EOS'
 #!/usr/bin/env bash
 set -Eeuo pipefail
 source /etc/trafficcop-agent.env
+METRICS_DIR="/run/trafficcop"
 
 while true; do
   : >"$METRICS_DIR/metrics.prom"
-  # metrics header
+  # metrics header (全部 untyped)
   {
     echo "# HELP traffic_rx_bytes_total Total received bytes."
     echo "# TYPE traffic_rx_bytes_total untyped"
@@ -154,4 +154,5 @@ if curl -s "$PG_URL_INPUT/metrics" | grep -q "instance=\"$INSTANCE\""; then
   log "✅ 自检成功: $INSTANCE 已在 Pushgateway 注册"
 else
   log "⚠️ 未检测到 $INSTANCE，请检查 agent 日志"
+  log "提示: 你可以尝试手工清理残余 -> curl -X DELETE $PG_URL_INPUT/metrics/job/$JOB/instance/$INSTANCE"
 fi
