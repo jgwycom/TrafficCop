@@ -1,4 +1,4 @@
-# AGENT_VERSION=3.0-final
+# AGENT_VERSION=3.1-final
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
@@ -29,6 +29,22 @@ clear_pg_job(){
   log "清空 Pushgateway job=$DEFAULT_JOB ..."
   local JENC; JENC="$(raw_urlencode "$DEFAULT_JOB")"
   curl -s -X DELETE "${DEFAULT_PG_URL%/}/metrics/job/${JENC}" || true
+}
+
+# 清理 node-01 残余
+clear_residual_node01(){
+  if curl -s "${DEFAULT_PG_URL%/}/metrics" | grep -q 'instance="node-01"'; then
+    log "⚠️ 检测到残余节点 node-01，尝试清理 ..."
+    local JENC; JENC="$(raw_urlencode "$DEFAULT_JOB")"
+    curl -s -X DELETE "${DEFAULT_PG_URL%/}/metrics/job/${JENC}/instance/node-01" || true
+    sleep 1
+    if curl -s "${DEFAULT_PG_URL%/}/metrics" | grep -q 'instance="node-01"'; then
+      log "❌ 残余节点 node-01 仍存在，请检查是否有旧 agent 在运行"
+      exit 1
+    else
+      log "✅ 残余节点 node-01 已清理"
+    fi
+  fi
 }
 
 ask_instance(){
@@ -62,7 +78,7 @@ write_agent(){
   install -d -m 755 "$DEFAULT_DIR" "$DEFAULT_RUN"
   cat >"$DEFAULT_DIR/agent.sh" <<'EOS'
 #!/usr/bin/env bash
-# AGENT_VERSION=3.0-final
+# AGENT_VERSION=3.1-final
 set -Eeuo pipefail
 . /etc/trafficcop-agent.env
 
@@ -141,7 +157,7 @@ self_check(){
     log "⚠️ 未找到 instance=$INSTANCE，请检查 agent 日志 (journalctl -u $UNIT)"
   fi
 
-  if curl -s "${DEFAULT_PG_URL%/}/metrics" | grep -q "node-01"; then
+  if curl -s "${DEFAULT_PG_URL%/}/metrics" | grep -q "instance=\"node-01\""; then
     log "⚠️ 注意：Pushgateway 仍然残留 node-01"
     log "👉 这会导致 Grafana 下拉框里还有 node-01，即使节点已不存在"
     log "👉 解决方法：清理 Prometheus TSDB 数据目录 或 改用新 job 名字"
@@ -152,6 +168,7 @@ install_all(){
   stop_service
   remove_old
   clear_pg_job
+  clear_residual_node01
   ask_instance
   write_env
   write_agent
