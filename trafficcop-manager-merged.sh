@@ -1,8 +1,8 @@
-# AGENT_VERSION=2.5-stable
+# AGENT_VERSION=3.0-final
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-# ===== Defaults =====
+# ===== Default config =====
 DEFAULT_PG_URL="${PG_URL:-http://127.0.0.1:9091}"
 DEFAULT_JOB="trafficcop"
 DEFAULT_INTERVAL="10"
@@ -15,11 +15,21 @@ UNIT="trafficcop-agent.service"
 
 # ===== Helpers =====
 log(){ echo "[$(date +'%F %T')] $*"; }
-die(){ echo "ERROR: $*" >&2; exit 1; }
-need_root(){ [[ $EUID -eq 0 ]] || die "Please run as root"; }
+die(){ echo "❌ ERROR: $*" >&2; exit 1; }
+need_root(){ [[ $EUID -eq 0 ]] || die "必须用 root 执行"; }
 
 stop_service(){ systemctl stop $UNIT 2>/dev/null || true; systemctl disable $UNIT 2>/dev/null || true; }
 remove_old(){ rm -rf "$DEFAULT_DIR" "$ENV_FILE" "$SERVICE_FILE" "$DEFAULT_RUN"; systemctl daemon-reload || true; }
+
+# URL encode
+raw_urlencode(){ local s="$1" out=""; local i c; for ((i=0;i<${#s};i++)); do c="${s:i:1}"; case "$c" in [a-zA-Z0-9._~-]) out+="$c";; *) printf -v out '%s%%%02X' "$out" "'$c";; esac; done; echo "$out"; }
+
+# 清空整个 job
+clear_pg_job(){
+  log "清空 Pushgateway job=$DEFAULT_JOB ..."
+  local JENC; JENC="$(raw_urlencode "$DEFAULT_JOB")"
+  curl -s -X DELETE "${DEFAULT_PG_URL%/}/metrics/job/${JENC}" || true
+}
 
 ask_instance(){
   local ans=""
@@ -52,7 +62,7 @@ write_agent(){
   install -d -m 755 "$DEFAULT_DIR" "$DEFAULT_RUN"
   cat >"$DEFAULT_DIR/agent.sh" <<'EOS'
 #!/usr/bin/env bash
-# AGENT_VERSION=2.5-stable
+# AGENT_VERSION=3.0-final
 set -Eeuo pipefail
 . /etc/trafficcop-agent.env
 
@@ -82,8 +92,6 @@ write_metrics(){
   mv -f "$tmp" "$METRICS"
 }
 
-raw_urlencode(){ local s="$1"; local out=""; local i c; for ((i=0;i<${#s};i++)); do c="${s:i:1}"; case "$c" in [a-zA-Z0-9._~-]) out+="$c";; *) printf -v out '%s%%%02X' "$out" "'$c";; esac; done; echo "$out"; }
-
 push_metrics(){
   local JENC; JENC="$(raw_urlencode "$JOB")"
   local IENC; IENC="$(raw_urlencode "$INSTANCE")"
@@ -93,7 +101,7 @@ push_metrics(){
     -H 'Content-Type: text/plain; version=0.0.4' \
     -X PUT --data-binary @"${METRICS}" "$url" || true)"
   if [[ "$code" != "202" && "$code" != "200" ]]; then
-    log error "Pushgateway returned HTTP $code"
+    log error "Pushgateway 返回 HTTP $code"
   fi
 }
 
@@ -124,9 +132,26 @@ WantedBy=multi-user.target
 EOF
 }
 
+self_check(){
+  log "自检：检查 Pushgateway 是否有 INSTANCE=$INSTANCE"
+  sleep 2
+  if curl -s "${DEFAULT_PG_URL%/}/metrics" | grep -q "instance=\"$INSTANCE\""; then
+    log "✅ 已找到 instance=$INSTANCE"
+  else
+    log "⚠️ 未找到 instance=$INSTANCE，请检查 agent 日志 (journalctl -u $UNIT)"
+  fi
+
+  if curl -s "${DEFAULT_PG_URL%/}/metrics" | grep -q "node-01"; then
+    log "⚠️ 注意：Pushgateway 仍然残留 node-01"
+    log "👉 这会导致 Grafana 下拉框里还有 node-01，即使节点已不存在"
+    log "👉 解决方法：清理 Prometheus TSDB 数据目录 或 改用新 job 名字"
+  fi
+}
+
 install_all(){
   stop_service
   remove_old
+  clear_pg_job
   ask_instance
   write_env
   write_agent
@@ -134,11 +159,10 @@ install_all(){
   systemctl daemon-reload
   systemctl enable $UNIT
   systemctl start $UNIT
-  sleep 2
-  systemctl status $UNIT --no-pager -l || true
+  self_check
 }
 
 # ===== Main =====
 need_root
 install_all
-log "Done. INSTANCE=$INSTANCE 已安装完成。请检查 Pushgateway /metrics。"
+log "Done. INSTANCE=$INSTANCE 安装完成。"
