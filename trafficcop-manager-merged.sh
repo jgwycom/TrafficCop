@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# AGENT_VERSION=2.2-final
+# AGENT_VERSION=2.3-final
 set -Eeuo pipefail
 
 log() { echo "[$(date '+%F %T')] $*"; }
@@ -11,7 +11,7 @@ SERVICE_FILE="/etc/systemd/system/trafficcop-agent.service"
 OLD_CONF="/root/TrafficCop/traffic_monitor_config.txt"
 
 #------------------------------
-# 函数: 清理 PG 残余
+# 清理 PG 残余
 #------------------------------
 pg_delete_instance() {
   local pg_url="$1" job="$2" inst="$3"
@@ -19,7 +19,7 @@ pg_delete_instance() {
 }
 
 #------------------------------
-# 读取旧版配置（迁移助手）
+# 迁移助手
 #------------------------------
 RESET_DAY_DEFAULT="1"
 LIMIT_BYTES_DEFAULT="0"
@@ -44,7 +44,7 @@ while true; do
   echo "❌ 无效的 INSTANCE，请重新输入"
 done
 
-# PG_URL: 优先用环境变量
+# PG_URL 优先取环境变量
 if [[ -n "${PG_URL:-}" ]]; then
   PG_URL_INPUT="$PG_URL"
 else
@@ -65,6 +65,19 @@ read -rp "流量配额 (GiB, 0=不限) [默认 $LIMIT_BYTES_DEFAULT]: " LIMIT_IN
 LIMIT_BYTES=$(awk "BEGIN {print (${LIMIT_INPUT:-$LIMIT_BYTES_DEFAULT} * 1024 * 1024 * 1024)}")
 
 #------------------------------
+# 网卡选择
+#------------------------------
+AVAILABLE_IFACES=$(ls /sys/class/net | grep -Ev '^(lo|docker.*|veth.*)$')
+echo "=============================="
+echo "检测到以下网络接口:"
+echo "$AVAILABLE_IFACES"
+echo "请输入需要监控的接口（可输入多个，以空格分隔）"
+echo "例如: eth0 或 eth0 ens3"
+echo "=============================="
+read -rp "IFACES: " IFACES_INPUT
+IFACES="${IFACES_INPUT:-eth0}"
+
+#------------------------------
 # 清理 PG 残余
 #------------------------------
 log "清理 Pushgateway 残余 (instance=$INSTANCE)"
@@ -79,7 +92,7 @@ PG_URL=$PG_URL_INPUT
 JOB=$JOB
 INSTANCE=$INSTANCE
 INTERVAL=$INTERVAL
-IFACES=AUTO
+IFACES="$IFACES"
 RESET_DAY=$RESET_DAY
 LIMIT_BYTES=$LIMIT_BYTES
 EOF
@@ -96,7 +109,6 @@ METRICS_DIR="/run/trafficcop"
 
 while true; do
   : >"$METRICS_DIR/metrics.prom"
-  # metrics header (全部 untyped)
   {
     echo "# HELP traffic_rx_bytes_total Total received bytes."
     echo "# TYPE traffic_rx_bytes_total untyped"
@@ -106,7 +118,7 @@ while true; do
     echo "# TYPE traffic_iface_up untyped"
   } >"$METRICS_DIR/metrics.prom"
 
-  for IF in $(ls /sys/class/net); do
+  for IF in $IFACES; do
     RX=$(cat /sys/class/net/$IF/statistics/rx_bytes 2>/dev/null || echo 0)
     TX=$(cat /sys/class/net/$IF/statistics/tx_bytes 2>/dev/null || echo 0)
     STATE=$(cat /sys/class/net/$IF/operstate 2>/dev/null | grep -q up && echo 1 || echo 0)
