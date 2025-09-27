@@ -2,7 +2,7 @@
 #!/usr/bin/env bash
 # trafficcop-manager-merged.sh
 # Robust installer/manager for TrafficCop Pushgateway Agent
-# Version 2.1-stable (with interactive INSTANCE)
+# Version 2.2-stable (with INSTANCE validation)
 set -Eeuo pipefail
 
 # ===== Default Configs =====
@@ -41,7 +41,7 @@ while [[ $# -gt 0 ]]; do
       cat <<'HLP'
 Usage: trafficcop-manager-merged.sh [options]
 
-Actions (choose one if non-interactive):
+Actions:
   --overwrite     Fresh reinstall (wipe old, then install)
   --keep          Keep current installation (no changes)
   --uninstall     Uninstall everything (service, files)
@@ -50,8 +50,7 @@ Optional:
   -y, --yes       Assume "yes" to prompts (non-interactive)
 HLP
       exit 0;;
-    *)
-      echo "Unknown option: $1"; exit 2;;
+    *) echo "Unknown option: $1"; exit 2;;
   esac
 done
 
@@ -61,21 +60,11 @@ die() { echo "ERROR: $*" >&2; exit 1; }
 need_root() { [[ ${EUID:-$(id -u)} -eq 0 ]] || die "Please run as root (sudo -i)."; }
 
 svc_is_installed() { [[ -f "$SERVICE_FILE" ]] || systemctl list-unit-files | grep -q "^trafficcop-agent\.service"; }
-svc_is_active() { systemctl is-active --quiet "$UNIT_NAME"; }
+ensure_dirs() { install -d -m 755 "$AGENT_DIR" "$DEFAULT_RUN_DIR"; }
 
-ensure_dirs() {
-  install -d -m 755 "$AGENT_DIR"
-  install -d -m 755 "$(dirname "$ENV_FILE")"
-  install -d -m 755 "$DEFAULT_RUN_DIR"
-}
-
-stop_disable_service() {
-  systemctl stop "$UNIT_NAME" 2>/dev/null || true
-  systemctl disable "$UNIT_NAME" 2>/dev/null || true
-}
-
+stop_disable_service() { systemctl stop "$UNIT_NAME" 2>/dev/null || true; systemctl disable "$UNIT_NAME" 2>/dev/null || true; }
 remove_old_cron() { rm -f "$CRON_FILE" 2>/dev/null || true; }
-remove_files() { rm -f "$SERVICE_FILE" || true; rm -rf "$AGENT_DIR" || true; rm -f "$ENV_FILE" || true; systemctl daemon-reload || true; }
+remove_files() { rm -f "$SERVICE_FILE" "$ENV_FILE" || true; rm -rf "$AGENT_DIR" || true; systemctl daemon-reload || true; }
 
 detect_existing() {
   local found="false"
@@ -116,7 +105,6 @@ clear_pushgateway() {
   INSTANCE="$(echo "$cfg" | cut -d'|' -f3)"
 
   log "Will clear Pushgateway for instance: ${INSTANCE} (job=${JOB}) at ${PG_URL}"
-
   if confirm "DELETE metrics for job=${JOB}, instance=${INSTANCE}?"; then
     curl -fsS -X DELETE "${PG_URL%/}/metrics/job/${JOB}/instance/${INSTANCE}" && log "Cleared job=${JOB}, instance=${INSTANCE}"
   fi
@@ -125,17 +113,25 @@ clear_pushgateway() {
   fi
 }
 
-# ===== New: Ask INSTANCE =====
+# ===== Ask INSTANCE (with validation) =====
 ask_instance_name() {
   local ans=""
   while true; do
     echo "=============================="
     echo "请输入当前节点的唯一标识 INSTANCE"
-    echo "⚠️ 注意：必须全局唯一，例如 node-01, db-02, proxy-03"
+    echo "⚠️  必须全局唯一，只允许字母、数字、点、横杠、下划线"
+    echo "例如：node-01, db_02, proxy-kr.03"
     echo "=============================="
     read -r -p "INSTANCE 名称: " ans
-    if [[ -n "$ans" ]]; then break
-    else echo "❌ INSTANCE 不能为空，请重新输入！"; fi
+    if [[ -z "$ans" ]]; then
+      echo "❌ INSTANCE 不能为空，请重新输入！"
+      continue
+    fi
+    if [[ ! "$ans" =~ ^[A-Za-z0-9._-]+$ ]]; then
+      echo "❌ INSTANCE 只能包含 [A-Za-z0-9._-]，请重新输入！"
+      continue
+    fi
+    break
   done
   INSTANCE="$ans"
 }
@@ -160,7 +156,7 @@ write_agent_script() {
   cat >"$AGENT_BIN" <<'EOS'
 #!/usr/bin/env bash
 # /opt/trafficcop-agent/agent.sh
-# AGENT_VERSION=2.1-stable
+# AGENT_VERSION=2.2-stable
 set -Eeuo pipefail
 
 ENV_FILE="/etc/trafficcop-agent.env"
@@ -202,8 +198,8 @@ list_ifaces() {
 write_metrics_once() {
   local tmp="${METRICS_PATH}.tmp"
   : > "$tmp"
-  printf '# HELP traffic_rx_bytes_total Total received bytes per interface.\n# TYPE traffic_rx_bytes_total counter\n' >>"$tmp"
-  printf '# HELP traffic_tx_bytes_total Total transmitted bytes per interface.\n# TYPE traffic_tx_bytes_total counter\n' >>"$tmp"
+  printf '# HELP traffic_rx_bytes_total Total received bytes.\n# TYPE traffic_rx_bytes_total counter\n' >>"$tmp"
+  printf '# HELP traffic_tx_bytes_total Total transmitted bytes.\n# TYPE traffic_tx_bytes_total counter\n' >>"$tmp"
   printf '# HELP traffic_iface_up Interface state (1=up,0=down).\n# TYPE traffic_iface_up gauge\n' >>"$tmp"
 
   for ifc in $(list_ifaces); do
@@ -276,22 +272,15 @@ self_check() {
   PG_URL="$(echo "$cfg" | cut -d'|' -f1)"
   JOB="$(echo "$cfg" | cut -d'|' -f2)"
   INSTANCE="$(echo "$cfg" | cut -d'|' -f3)"
-  log "Self-check: querying ${PG_URL}/metrics for '^traffic_' ..."
+  log "Self-check: querying ${PG_URL}/metrics ..."
   curl -fsS "${PG_URL%/}/metrics" | grep -E '^traffic_' | head -n 20 || true
 }
 
-uninstall_all() {
-  log "Uninstalling ..."
-  stop_disable_service || true
-  remove_old_cron || true
-  remove_files || true
-  log "Uninstalled."
-}
+uninstall_all() { log "Uninstalling ..."; stop_disable_service || true; remove_old_cron || true; remove_files || true; }
 
 # ===== Main =====
 need_root
 EXISTING="$(detect_existing)"
-
 ACTION=""
 if [[ "$FLAG_UNINSTALL" == "true" ]]; then ACTION="U"
 elif [[ "$FLAG_OVERWRITE" == "true" ]]; then ACTION="O"
