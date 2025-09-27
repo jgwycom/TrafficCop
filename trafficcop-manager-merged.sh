@@ -1,13 +1,14 @@
-# AGENT_VERSION=2.1-stable
+# AGENT_VERSION=2.2-stable
 #!/usr/bin/env bash
 # trafficcop-manager-merged.sh
 # Robust installer/manager for TrafficCop Pushgateway Agent
-# 强制 INSTANCE 交互输入 + 自动清理 + agent.sh 编码修复
+# 关键修复：不再在指标里写入 instance=label，避免与 Pushgateway 分组键冲突导致 400。
+# 其他：强制交互式 INSTANCE 输入与校验、自动清理、LC_ALL=C 输出、严格从 env 读取配置。
 
 set -Eeuo pipefail
 
 # ===== Default Configs =====
-DEFAULT_PG_URL="${PG_URL:-http://127.0.0.1:9091}"
+DEFAULT_PG_URL="${PG_URL:-http://127.0.0.1:9091}"   # 允许通过环境变量 PG_URL 预置，否则默认本地
 DEFAULT_JOB_NAME="trafficcop"
 DEFAULT_PUSH_INTERVAL="10"
 DEFAULT_CURL_TIMEOUT="5"
@@ -47,7 +48,7 @@ Actions:
   --keep          Keep current installation (no changes)
   --uninstall     Uninstall everything (service, files)
 Optional:
-  --clear-pg      Also clear Pushgateway metrics for this instance (or whole job if confirmed)
+  --clear-pg      Also clear Pushgateway metrics for this instance (and whole job)
   -y, --yes       Assume "yes" to prompts (non-interactive)
 HLP
       exit 0;;
@@ -100,6 +101,7 @@ clear_pushgateway() {
   INSTANCE="$(echo "$cfg" | cut -d'|' -f3)"
 
   log "Clearing Pushgateway (job=${JOB}, instance=${INSTANCE}) at ${PG_URL}"
+  # 先删该实例，再删整个 job，尽量把旧残留一次清空
   curl -fsS -X DELETE "${PG_URL%/}/metrics/job/${JOB}/instance/${INSTANCE}" || true
   curl -fsS -X DELETE "${PG_URL%/}/metrics/job/${JOB}" || true
 }
@@ -110,8 +112,8 @@ ask_instance_name() {
   while true; do
     echo "=============================="
     echo "请输入当前节点的唯一标识 INSTANCE"
-    echo "⚠️ 必须全局唯一，只允许字母、数字、点、横杠、下划线"
-    echo "示例：node-01, db_02, proxy-kr.03"
+    echo "⚠️  必须全局唯一，只允许字母、数字、点、横杠、下划线"
+    echo "示例：node-01, db_02, proxy-kr.03, SzHdy-HK"
     echo "=============================="
     read -r -p "INSTANCE 名称: " ans
     if [[ -z "$ans" ]]; then
@@ -146,7 +148,7 @@ EOF
 write_agent_script() {
   cat >"$AGENT_BIN" <<'EOS'
 #!/usr/bin/env bash
-# AGENT_VERSION=2.1-stable
+# AGENT_VERSION=2.2-stable
 # /opt/trafficcop-agent/agent.sh
 set -Eeuo pipefail
 
@@ -163,10 +165,7 @@ RUN_DIR="${RUN_DIR:-/run/trafficcop}"
 METRICS_PATH="${METRICS_PATH:-${RUN_DIR}/metrics.prom}"
 LOG_LEVEL="${LOG_LEVEL:-info}"
 
-log() {
-  local lvl="$1"; shift
-  echo "[$(date +'%F %T')] [$lvl] $*"
-}
+log() { echo "[$(date +'%F %T')] [$1] ${*:2}"; }
 
 ensure_dirs() { install -d -m 755 "$RUN_DIR"; }
 iface_up() { [[ "$(cat /sys/class/net/$1/operstate 2>/dev/null || echo down)" == "up" ]] && echo 1 || echo 0; }
@@ -188,17 +187,19 @@ write_metrics_once() {
   local tmp="${METRICS_PATH}.tmp"
   : > "$tmp"
 
-  LC_ALL=C printf '# HELP traffic_rx_bytes_total Total received bytes.\n# TYPE traffic_rx_bytes_total counter\n' >>"$tmp"
-  LC_ALL=C printf '# HELP traffic_tx_bytes_total Total transmitted bytes.\n# TYPE traffic_tx_bytes_total counter\n' >>"$tmp"
-  LC_ALL=C printf '# HELP traffic_iface_up Interface state (1=up,0=down).\n# TYPE traffic_iface_up gauge\n' >>"$tmp"
+  LC_ALL=C printf '# HELP traffic_rx_bytes_total Total received bytes per interface.\n# TYPE traffic_rx_bytes_total counter\n' >>"$tmp"
+  LC_ALL=C printf '# HELP traffic_tx_bytes_total Total transmitted bytes per interface.\n# TYPE traffic_tx_bytes_total counter\n' >>"$tmp"
+  LC_ALL=C printf '# HELP traffic_iface_up Interface link state (1=up,0=down).\n# TYPE traffic_iface_up gauge\n' >>"$tmp"
 
   for ifc in $(list_ifaces); do
+    local rx tx up
     rx="$(read_stat "$ifc" rx)"
     tx="$(read_stat "$ifc" tx)"
     up="$(iface_up "$ifc")"
-    LC_ALL=C printf 'traffic_rx_bytes_total{instance="%s",iface="%s"} %s\n' "$INSTANCE" "$ifc" "$rx" >>"$tmp"
-    LC_ALL=C printf 'traffic_tx_bytes_total{instance="%s",iface="%s"} %s\n' "$INSTANCE" "$ifc" "$tx" >>"$tmp"
-    LC_ALL=C printf 'traffic_iface_up{instance="%s",iface="%s"} %s\n' "$INSTANCE" "$ifc" "$up" >>"$tmp"
+    # ⚠️ 不要写 instance=label；Pushgateway 会自动加 job/instance（来自 URL 分组键）
+    LC_ALL=C printf 'traffic_rx_bytes_total{iface="%s"} %s\n' "$ifc" "$rx" >>"$tmp"
+    LC_ALL=C printf 'traffic_tx_bytes_total{iface="%s"} %s\n' "$ifc" "$tx" >>"$tmp"
+    LC_ALL=C printf 'traffic_iface_up{iface="%s"} %s\n' "$ifc" "$up" >>"$tmp"
   done
 
   mv -f "$tmp" "$METRICS_PATH"
@@ -206,9 +207,12 @@ write_metrics_once() {
 
 push_metrics() {
   local url="${PG_URL%/}/metrics/job/${JOB_NAME}/instance/${INSTANCE}"
+  # 设定 Content-Type，并丢弃响应体避免 curl: (23)
   local code
-  code="$(curl -sS -m "${CURL_TIMEOUT}" -o /dev/stderr -w '%{http_code}' -X PUT --data-binary @"${METRICS_PATH}" "${url}" || true)"
-  [[ "$code" != "200" && "$code" != "202" ]] && log error "Pushgateway returned HTTP $code"
+  code="$(curl -sS -m "${CURL_TIMEOUT}" -o /dev/null -w '%{http_code}' \
+    -H 'Content-Type: text/plain; version=0.0.4; charset=utf-8' \
+    -X PUT --data-binary @"${METRICS_PATH}" "${url}" || true)"
+  [[ "$code" != "200" && "$code" != "202" ]] && log error "Pushgateway returned HTTP $code for ${url}"
 }
 
 main_loop() {
@@ -266,7 +270,7 @@ self_check() {
   PG_URL="$(echo "$cfg" | cut -d'|' -f1)"
   JOB="$(echo "$cfg" | cut -d'|' -f2)"
   INSTANCE="$(echo "$cfg" | cut -d'|' -f3)"
-  log "Self-check: querying ${PG_URL}/metrics ..."
+  log "Self-check: querying ${PG_URL}/metrics for '^traffic_' ..."
   curl -fsS "${PG_URL%/}/metrics" | grep -E '^traffic_' | head -n 20 || true
 }
 
