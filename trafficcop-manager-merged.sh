@@ -1,13 +1,13 @@
-# AGENT_VERSION=2.0-stable
+# AGENT_VERSION=2.1-stable
 #!/usr/bin/env bash
 # trafficcop-manager-merged.sh
 # Robust installer/manager for TrafficCop Pushgateway Agent
-# 强制 INSTANCE 交互输入 + 校验，只认 /etc/trafficcop-agent.env
+# 强制 INSTANCE 交互输入 + 自动清理 + agent.sh 编码修复
 
 set -Eeuo pipefail
 
 # ===== Default Configs =====
-DEFAULT_PG_URL="http://45.78.23.232:19091"
+DEFAULT_PG_URL="${PG_URL:-http://127.0.0.1:9091}"
 DEFAULT_JOB_NAME="trafficcop"
 DEFAULT_PUSH_INTERVAL="10"
 DEFAULT_CURL_TIMEOUT="5"
@@ -99,13 +99,9 @@ clear_pushgateway() {
   JOB="$(echo "$cfg" | cut -d'|' -f2)"
   INSTANCE="$(echo "$cfg" | cut -d'|' -f3)"
 
-  log "Will clear Pushgateway for instance: ${INSTANCE} (job=${JOB}) at ${PG_URL}"
-  if confirm "DELETE metrics for job=${JOB}, instance=${INSTANCE}?"; then
-    curl -fsS -X DELETE "${PG_URL%/}/metrics/job/${JOB}/instance/${INSTANCE}" && log "Cleared job=${JOB}, instance=${INSTANCE}"
-  fi
-  if confirm "ALSO delete the entire job=${JOB}?"; then
-    curl -fsS -X DELETE "${PG_URL%/}/metrics/job/${JOB}" && log "Cleared entire job=${JOB}"
-  fi
+  log "Clearing Pushgateway (job=${JOB}, instance=${INSTANCE}) at ${PG_URL}"
+  curl -fsS -X DELETE "${PG_URL%/}/metrics/job/${JOB}/instance/${INSTANCE}" || true
+  curl -fsS -X DELETE "${PG_URL%/}/metrics/job/${JOB}" || true
 }
 
 # ===== Ask INSTANCE (with validation) =====
@@ -150,7 +146,7 @@ EOF
 write_agent_script() {
   cat >"$AGENT_BIN" <<'EOS'
 #!/usr/bin/env bash
-# AGENT_VERSION=2.0-stable
+# AGENT_VERSION=2.1-stable
 # /opt/trafficcop-agent/agent.sh
 set -Eeuo pipefail
 
@@ -169,9 +165,7 @@ LOG_LEVEL="${LOG_LEVEL:-info}"
 
 log() {
   local lvl="$1"; shift
-  if [[ "$lvl" == "error" ]] || [[ "$LOG_LEVEL" == "debug" ]] || [[ "$lvl" == "info" ]]; then
-    echo "[$(date +'%F %T')] [$lvl] $*"
-  fi
+  echo "[$(date +'%F %T')] [$lvl] $*"
 }
 
 ensure_dirs() { install -d -m 755 "$RUN_DIR"; }
@@ -193,15 +187,20 @@ list_ifaces() {
 write_metrics_once() {
   local tmp="${METRICS_PATH}.tmp"
   : > "$tmp"
-  printf '# HELP traffic_rx_bytes_total Total received bytes.\n# TYPE traffic_rx_bytes_total counter\n' >>"$tmp"
-  printf '# HELP traffic_tx_bytes_total Total transmitted bytes.\n# TYPE traffic_tx_bytes_total counter\n' >>"$tmp"
-  printf '# HELP traffic_iface_up Interface state (1=up,0=down).\n# TYPE traffic_iface_up gauge\n' >>"$tmp"
+
+  LC_ALL=C printf '# HELP traffic_rx_bytes_total Total received bytes.\n# TYPE traffic_rx_bytes_total counter\n' >>"$tmp"
+  LC_ALL=C printf '# HELP traffic_tx_bytes_total Total transmitted bytes.\n# TYPE traffic_tx_bytes_total counter\n' >>"$tmp"
+  LC_ALL=C printf '# HELP traffic_iface_up Interface state (1=up,0=down).\n# TYPE traffic_iface_up gauge\n' >>"$tmp"
 
   for ifc in $(list_ifaces); do
-    printf 'traffic_rx_bytes_total{instance="%s",iface="%s"} %s\n' "$INSTANCE" "$ifc" "$(read_stat "$ifc" rx)" >>"$tmp"
-    printf 'traffic_tx_bytes_total{instance="%s",iface="%s"} %s\n' "$INSTANCE" "$ifc" "$(read_stat "$ifc" tx)" >>"$tmp"
-    printf 'traffic_iface_up{instance="%s",iface="%s"} %s\n' "$INSTANCE" "$ifc" "$(iface_up "$ifc")" >>"$tmp"
+    rx="$(read_stat "$ifc" rx)"
+    tx="$(read_stat "$ifc" tx)"
+    up="$(iface_up "$ifc")"
+    LC_ALL=C printf 'traffic_rx_bytes_total{instance="%s",iface="%s"} %s\n' "$INSTANCE" "$ifc" "$rx" >>"$tmp"
+    LC_ALL=C printf 'traffic_tx_bytes_total{instance="%s",iface="%s"} %s\n' "$INSTANCE" "$ifc" "$tx" >>"$tmp"
+    LC_ALL=C printf 'traffic_iface_up{instance="%s",iface="%s"} %s\n' "$INSTANCE" "$ifc" "$up" >>"$tmp"
   done
+
   mv -f "$tmp" "$METRICS_PATH"
 }
 
