@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# AGENT_VERSION=2.4-final
+# AGENT_VERSION=2.5-final
 set -Eeuo pipefail
 
 log() { echo "[$(date '+%F %T')] $*"; }
@@ -11,11 +11,30 @@ SERVICE_FILE="/etc/systemd/system/trafficcop-agent.service"
 OLD_CONF="/root/TrafficCop/traffic_monitor_config.txt"
 
 #------------------------------
-# 清理 PG 残余
+# 清理指定 instance
 #------------------------------
 pg_delete_instance() {
   local pg_url="$1" job="$2" inst="$3"
   curl -s -X DELETE "${pg_url}/metrics/job/${job}/instance/${inst}" >/dev/null || true
+}
+
+#------------------------------
+# 全量清理 job 残余
+#------------------------------
+pg_cleanup_all() {
+  local pg_url="$1" job="$2"
+  log "检测并清理 $job 下的残余 instance ..."
+  INSTANCES=$(curl -s "$pg_url/metrics" | grep "job=\"$job\"" | sed -n 's/.*instance=\"\([^\"]*\)\".*/\1/p' | sort -u || true)
+  if [[ -z "$INSTANCES" ]]; then
+    log "未发现残余 instance"
+    return
+  fi
+  for inst in $INSTANCES; do
+    if [[ "$inst" != "$INSTANCE" ]]; then
+      log "清理旧残余 instance=$inst"
+      curl -s -X DELETE "$pg_url/metrics/job/$job/instance/$inst" >/dev/null || true
+    fi
+  done
 }
 
 #------------------------------
@@ -166,11 +185,13 @@ systemctl enable --now trafficcop-agent
 log "已写入 systemd 单元 $SERVICE_FILE 并启动服务"
 
 #------------------------------
-# 自检
+# 自检 + 残余清理
 #------------------------------
 sleep 3
 if curl -s "$PG_URL_INPUT/metrics" | grep -q "instance=\"$INSTANCE\""; then
   log "✅ 自检成功: $INSTANCE 已在 Pushgateway 注册"
+  pg_cleanup_all "$PG_URL_INPUT" "$JOB"
+  log "✅ 残余清理完成，Pushgateway 仅保留当前实例 $INSTANCE"
 else
   log "⚠️ 未检测到 $INSTANCE，请检查 agent 日志"
   log "提示: 你可以尝试手工清理残余 -> curl -X DELETE $PG_URL_INPUT/metrics/job/$JOB/instance/$INSTANCE"
