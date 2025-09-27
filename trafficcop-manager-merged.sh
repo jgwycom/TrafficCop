@@ -85,30 +85,32 @@ read -rp "流量配额 (GiB, 0=不限) [默认 $LIMIT_BYTES_DEFAULT]: " LIMIT_IN
 LIMIT_BYTES=$(awk "BEGIN {print (${LIMIT_INPUT:-$LIMIT_BYTES_DEFAULT} * 1024 * 1024 * 1024)}")
 
 #------------------------------
+# 自动推导 PANEL_API
+#------------------------------
+PANEL_HOST=$(echo "$PG_URL_INPUT" | sed -E 's#^https?://([^:/]+).*#\1#')
+PANEL_API="http://${PANEL_HOST}:18000"
+log "自动推导 PANEL_API=$PANEL_API"
+
+#------------------------------
 # 唯一 NODE_ID 处理
 #------------------------------
 if [[ -f "$NODE_ID_FILE" ]]; then
   NODE_ID=$(cat "$NODE_ID_FILE")
   log "检测到已有 NODE_ID=$NODE_ID"
 else
-  if [[ -n "${PANEL_API:-}" ]]; then
-    log "向面板机申请新的 NODE_ID..."
-    NODE_ID=$(curl -s -X POST "$PANEL_API/nodes" \
-      -H "Content-Type: application/json" \
-      -d "{\"instance\":\"$INSTANCE\",\"display_name\":\"$INSTANCE\",\"sort_order\":0,\"reset_day\":$RESET_DAY,\"limit_bytes\":$LIMIT_BYTES,\"limit_mode\":\"double\",\"bandwidth_bps\":0}" \
-      | jq -r '.id // empty')
+  log "向面板机申请新的 NODE_ID..."
+  NODE_ID=$(curl -s -X POST "$PANEL_API/nodes" \
+    -H "Content-Type: application/json" \
+    -d "{\"instance\":\"$INSTANCE\",\"display_name\":\"$INSTANCE\",\"sort_order\":0,\"reset_day\":$RESET_DAY,\"limit_bytes\":$LIMIT_BYTES,\"limit_mode\":\"double\",\"bandwidth_bps\":0}" \
+    | jq -r '.id // empty')
 
-    if [[ -z "$NODE_ID" || "$NODE_ID" == "null" ]]; then
-      log "❌ 获取 NODE_ID 失败，请检查 PANEL_API 设置"
-      exit 1
-    fi
-
-    echo "$NODE_ID" > "$NODE_ID_FILE"
-    log "已分配 NODE_ID=$NODE_ID"
-  else
-    log "⚠️ 未设置 PANEL_API，无法分配 NODE_ID"
-    NODE_ID=0
+  if [[ -z "$NODE_ID" || "$NODE_ID" == "null" ]]; then
+    log "❌ 获取 NODE_ID 失败，请检查 PANEL_API 设置"
+    exit 1
   fi
+
+  echo "$NODE_ID" > "$NODE_ID_FILE"
+  log "已分配 NODE_ID=$NODE_ID"
 fi
 
 #------------------------------
