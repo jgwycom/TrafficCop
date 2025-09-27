@@ -2,26 +2,25 @@
 #!/usr/bin/env bash
 # trafficcop-manager-merged.sh
 # Robust installer/manager for TrafficCop Pushgateway Agent
-# Tested on Debian/Ubuntu-family systemd hosts
+# Version 2.1-stable (with interactive INSTANCE)
 set -Eeuo pipefail
 
-# ===== Default Configs (can be overridden in /etc/trafficcop-agent.env) =====
+# ===== Default Configs =====
 DEFAULT_PG_URL="http://45.78.23.232:19091"
 DEFAULT_JOB_NAME="trafficcop"
-DEFAULT_INSTANCE="$(hostname -f 2>/dev/null || hostname)"
-DEFAULT_PUSH_INTERVAL="10"           # seconds
-DEFAULT_CURL_TIMEOUT="5"             # seconds
-DEFAULT_IFACES="AUTO"                # AUTO | space-separated list | "*" = all non-lo
+DEFAULT_PUSH_INTERVAL="10"
+DEFAULT_CURL_TIMEOUT="5"
+DEFAULT_IFACES="AUTO"
 DEFAULT_RUN_DIR="/run/trafficcop"
 DEFAULT_METRICS_PATH="${DEFAULT_RUN_DIR}/metrics.prom"
-DEFAULT_LOG_LEVEL="info"             # info|debug
+DEFAULT_LOG_LEVEL="info"
 
 # ===== Paths =====
 AGENT_DIR="/opt/trafficcop-agent"
 AGENT_BIN="${AGENT_DIR}/agent.sh"
 ENV_FILE="/etc/trafficcop-agent.env"
 SERVICE_FILE="/etc/systemd/system/trafficcop-agent.service"
-CRON_FILE="/etc/cron.d/trafficcop-agent" # 旧版本兜底
+CRON_FILE="/etc/cron.d/trafficcop-agent"
 UNIT_NAME="trafficcop-agent.service"
 
 # ===== CLI Flags =====
@@ -47,11 +46,8 @@ Actions (choose one if non-interactive):
   --keep          Keep current installation (no changes)
   --uninstall     Uninstall everything (service, files)
 Optional:
-  --clear-pg      Also clear Pushgateway metrics for this instance (or whole job if --yes and confirm)
+  --clear-pg      Also clear Pushgateway metrics for this instance (or whole job if confirmed)
   -y, --yes       Assume "yes" to prompts (non-interactive)
-
-If no action flags are provided, script will interactively ask:
-  [O]verwrite / [K]eep / [U]ninstall
 HLP
       exit 0;;
     *)
@@ -78,16 +74,8 @@ stop_disable_service() {
   systemctl disable "$UNIT_NAME" 2>/dev/null || true
 }
 
-remove_old_cron() {
-  rm -f "$CRON_FILE" 2>/dev/null || true
-}
-
-remove_files() {
-  rm -f "$SERVICE_FILE" || true
-  rm -rf "$AGENT_DIR" || true
-  rm -f "$ENV_FILE" || true
-  systemctl daemon-reload || true
-}
+remove_old_cron() { rm -f "$CRON_FILE" 2>/dev/null || true; }
+remove_files() { rm -f "$SERVICE_FILE" || true; rm -rf "$AGENT_DIR" || true; rm -f "$ENV_FILE" || true; systemctl daemon-reload || true; }
 
 detect_existing() {
   local found="false"
@@ -100,24 +88,20 @@ detect_existing() {
 
 confirm() {
   local prompt="$1"
-  if [[ "$FLAG_YES" == "true" ]]; then
-    return 0
-  fi
+  if [[ "$FLAG_YES" == "true" ]]; then return 0; fi
   read -r -p "$prompt [y/N]: " ans || true
   [[ "${ans,,}" == "y" || "${ans,,}" == "yes" ]]
 }
 
-# Read env with defaults (for Pushgateway clearing/self-check)
 read_env_effective() {
   local PG_URL="$DEFAULT_PG_URL"
   local JOB="$DEFAULT_JOB_NAME"
-  local INST="$DEFAULT_INSTANCE"
+  local INST="UNKNOWN"
   if [[ -f "$ENV_FILE" ]]; then
-    # shellcheck disable=SC1090
     . "$ENV_FILE"
     PG_URL="${PG_URL:-$DEFAULT_PG_URL}"
     JOB_NAME="${JOB_NAME:-$DEFAULT_JOB_NAME}"
-    INSTANCE="${INSTANCE:-$DEFAULT_INSTANCE}"
+    INSTANCE="${INSTANCE:-UNKNOWN}"
     echo "$PG_URL|${JOB_NAME}|${INSTANCE}"
   else
     echo "$PG_URL|$JOB|$INST"
@@ -135,27 +119,36 @@ clear_pushgateway() {
 
   if confirm "DELETE metrics for job=${JOB}, instance=${INSTANCE}?"; then
     curl -fsS -X DELETE "${PG_URL%/}/metrics/job/${JOB}/instance/${INSTANCE}" && log "Cleared job=${JOB}, instance=${INSTANCE}"
-  else
-    log "Skipped instance delete."
   fi
-
-  if confirm "ALSO delete the entire job=${JOB} (all instances)?"; then
+  if confirm "ALSO delete the entire job=${JOB}?"; then
     curl -fsS -X DELETE "${PG_URL%/}/metrics/job/${JOB}" && log "Cleared entire job=${JOB}"
-  else
-    log "Skipped whole-job delete."
   fi
+}
+
+# ===== New: Ask INSTANCE =====
+ask_instance_name() {
+  local ans=""
+  while true; do
+    echo "=============================="
+    echo "请输入当前节点的唯一标识 INSTANCE"
+    echo "⚠️ 注意：必须全局唯一，例如 node-01, db-02, proxy-03"
+    echo "=============================="
+    read -r -p "INSTANCE 名称: " ans
+    if [[ -n "$ans" ]]; then break
+    else echo "❌ INSTANCE 不能为空，请重新输入！"; fi
+  done
+  INSTANCE="$ans"
 }
 
 write_env_file() {
   cat >"$ENV_FILE" <<EOF
 # Environment for trafficcop-agent
-# You can edit and 'systemctl restart trafficcop-agent' to apply.
 PG_URL="${DEFAULT_PG_URL}"
 JOB_NAME="${DEFAULT_JOB_NAME}"
-INSTANCE="${DEFAULT_INSTANCE}"
+INSTANCE="${INSTANCE}"
 PUSH_INTERVAL="${DEFAULT_PUSH_INTERVAL}"
 CURL_TIMEOUT="${DEFAULT_CURL_TIMEOUT}"
-IFACES="${DEFAULT_IFACES}"      # AUTO | "*" | "eth0 ens3 ..." (space separated)
+IFACES="${DEFAULT_IFACES}"
 RUN_DIR="${DEFAULT_RUN_DIR}"
 METRICS_PATH="${DEFAULT_METRICS_PATH}"
 LOG_LEVEL="${DEFAULT_LOG_LEVEL}"
@@ -167,16 +160,15 @@ write_agent_script() {
   cat >"$AGENT_BIN" <<'EOS'
 #!/usr/bin/env bash
 # /opt/trafficcop-agent/agent.sh
-# AGENT_VERSION=2.0-stable
+# AGENT_VERSION=2.1-stable
 set -Eeuo pipefail
 
-# Load env (with fallbacks)
 ENV_FILE="/etc/trafficcop-agent.env"
 [[ -f "$ENV_FILE" ]] && . "$ENV_FILE"
 
 PG_URL="${PG_URL:-http://127.0.0.1:9091}"
 JOB_NAME="${JOB_NAME:-trafficcop}"
-INSTANCE="${INSTANCE:-$(hostname -f 2>/dev/null || hostname)}"
+INSTANCE="${INSTANCE:?INSTANCE not set in env file}"
 PUSH_INTERVAL="${PUSH_INTERVAL:-10}"
 CURL_TIMEOUT="${CURL_TIMEOUT:-5}"
 IFACES="${IFACES:-AUTO}"
@@ -191,100 +183,48 @@ log() {
   fi
 }
 
-cleanup() {
-  log info "Exiting, cleaning up..."
-  exit 0
-}
-trap cleanup INT TERM
-
-ensure_dirs() {
-  install -d -m 755 "$RUN_DIR"
-}
+ensure_dirs() { install -d -m 755 "$RUN_DIR"; }
+iface_up() { [[ "$(cat /sys/class/net/$1/operstate 2>/dev/null || echo down)" == "up" ]] && echo 1 || echo 0; }
+read_stat() { cat "/sys/class/net/$1/statistics/${2}_bytes" 2>/dev/null || echo 0; }
 
 list_ifaces() {
   local ret=()
   if [[ "$IFACES" == "AUTO" ]]; then
-    # 默认选择默认路由的出接口 + 其他UP的非lo接口
-    local def; def="$(ip route 2>/dev/null | awk '/^default/ {print $5; exit}')" || true
+    local def; def="$(ip route 2>/dev/null | awk '/^default/ {print $5; exit}')"
     [[ -n "$def" ]] && ret+=("$def")
-    while IFS= read -r name; do
-      [[ "$name" == "lo" ]] && continue
-      ret+=("$name")
-    done < <(ip -o link show up 2>/dev/null | awk -F': ' '{print $2}')
+    while IFS= read -r name; do [[ "$name" != "lo" ]] && ret+=("$name"); done < <(ip -o link show up | awk -F': ' '{print $2}')
   elif [[ "$IFACES" == "*" ]]; then
-    while IFS= read -r name; do
-      [[ "$name" == "lo" ]] && continue
-      ret+=("$name")
-    done < <(ls -1 /sys/class/net 2>/dev/null || true)
-  else
-    # space-separated list
-    read -r -a ret <<<"$IFACES"
-  fi
-  printf '%s\n' "${ret[@]}" | awk 'NF' | sort -u
-}
-
-iface_up() {
-  local ifc="$1"
-  local state_file="/sys/class/net/${ifc}/operstate"
-  [[ -r "$state_file" ]] || { echo 0; return; }
-  local st; st="$(cat "$state_file" 2>/dev/null || echo "down")"
-  [[ "$st" == "up" ]] && echo 1 || echo 0
-}
-
-read_stat() {
-  # $1=iface $2=rx|tx
-  local file="/sys/class/net/$1/statistics/${2}_bytes"
-  [[ -r "$file" ]] && cat "$file" || echo 0
+    for n in /sys/class/net/*; do [[ "$(basename "$n")" != "lo" ]] && ret+=("$(basename "$n")"); done
+  else read -r -a ret <<<"$IFACES"; fi
+  printf '%s\n' "${ret[@]}" | sort -u
 }
 
 write_metrics_once() {
   local tmp="${METRICS_PATH}.tmp"
   : > "$tmp"
+  printf '# HELP traffic_rx_bytes_total Total received bytes per interface.\n# TYPE traffic_rx_bytes_total counter\n' >>"$tmp"
+  printf '# HELP traffic_tx_bytes_total Total transmitted bytes per interface.\n# TYPE traffic_tx_bytes_total counter\n' >>"$tmp"
+  printf '# HELP traffic_iface_up Interface state (1=up,0=down).\n# TYPE traffic_iface_up gauge\n' >>"$tmp"
 
-  printf '# HELP traffic_rx_bytes_total Total received bytes per interface.\n' >>"$tmp"
-  printf '# TYPE traffic_rx_bytes_total counter\n' >>"$tmp"
-  printf '# HELP traffic_tx_bytes_total Total transmitted bytes per interface.\n' >>"$tmp"
-  printf '# TYPE traffic_tx_bytes_total counter\n' >>"$tmp"
-  printf '# HELP traffic_iface_up Interface link state (1=up, 0=down).\n' >>"$tmp"
-  printf '# TYPE traffic_iface_up gauge\n' >>"$tmp"
-
-  local ifaces; ifaces=($(list_ifaces))
-  for ifc in "${ifaces[@]}"; do
-    local rx tx up
-    rx="$(read_stat "$ifc" rx)"
-    tx="$(read_stat "$ifc" tx)"
-    up="$(iface_up "$ifc")"
-    # Labels: instance & iface
-    printf 'traffic_rx_bytes_total{instance="%s",iface="%s"} %s\n' "$INSTANCE" "$ifc" "$rx" >>"$tmp"
-    printf 'traffic_tx_bytes_total{instance="%s",iface="%s"} %s\n' "$INSTANCE" "$ifc" "$tx" >>"$tmp"
-    printf 'traffic_iface_up{instance="%s",iface="%s"} %s\n' "$INSTANCE" "$ifc" "$up" >>"$tmp"
+  for ifc in $(list_ifaces); do
+    printf 'traffic_rx_bytes_total{instance="%s",iface="%s"} %s\n' "$INSTANCE" "$ifc" "$(read_stat "$ifc" rx)" >>"$tmp"
+    printf 'traffic_tx_bytes_total{instance="%s",iface="%s"} %s\n' "$INSTANCE" "$ifc" "$(read_stat "$ifc" tx)" >>"$tmp"
+    printf 'traffic_iface_up{instance="%s",iface="%s"} %s\n' "$INSTANCE" "$ifc" "$(iface_up "$ifc")" >>"$tmp"
   done
-
-  # Atomic move
   mv -f "$tmp" "$METRICS_PATH"
 }
 
 push_metrics() {
   local url="${PG_URL%/}/metrics/job/${JOB_NAME}/instance/${INSTANCE}"
-  # Pushgateway expects PUT or POST; we use PUT to replace group
   local code
-  code="$(curl -sS -m "${CURL_TIMEOUT}" -o /dev/stderr -w '%{http_code}' \
-    -X PUT --data-binary @"${METRICS_PATH}" "${url}" || true)"
-  if [[ "$code" != "200" && "$code" != "202" ]]; then
-    log error "Pushgateway returned HTTP $code for ${url}"
-  else
-    log debug "Pushed OK to ${url}"
-  fi
+  code="$(curl -sS -m "${CURL_TIMEOUT}" -o /dev/stderr -w '%{http_code}' -X PUT --data-binary @"${METRICS_PATH}" "${url}" || true)"
+  [[ "$code" != "200" && "$code" != "202" ]] && log error "Pushgateway returned HTTP $code"
 }
 
 main_loop() {
   ensure_dirs
   log info "Agent started (JOB=${JOB_NAME}, INSTANCE=${INSTANCE}, PG=${PG_URL}, INTERVAL=${PUSH_INTERVAL}, IFACES=${IFACES})"
-  while true; do
-    write_metrics_once
-    push_metrics
-    sleep "${PUSH_INTERVAL}"
-  done
+  while true; do write_metrics_once; push_metrics; sleep "${PUSH_INTERVAL}"; done
 }
 
 main_loop
@@ -294,7 +234,6 @@ EOS
 
 write_service_unit() {
   cat >"$SERVICE_FILE" <<EOF
-# $SERVICE_FILE
 [Unit]
 Description=TrafficCop Pushgateway Agent
 After=network-online.target
@@ -316,9 +255,10 @@ EOF
 
 install_or_overwrite() {
   log "Installing (fresh) ..."
+  ask_instance_name
   stop_disable_service || true
   remove_old_cron || true
-  remove_files || true   # ensure full wipe
+  remove_files || true
   ensure_dirs
   write_env_file
   write_agent_script
@@ -336,13 +276,8 @@ self_check() {
   PG_URL="$(echo "$cfg" | cut -d'|' -f1)"
   JOB="$(echo "$cfg" | cut -d'|' -f2)"
   INSTANCE="$(echo "$cfg" | cut -d'|' -f3)"
-
-  log "Self-check: querying ${PG_URL}/metrics for '^traffic_' (job=${JOB}, instance=${INSTANCE}) ..."
-  # 优先只看该 job/instance 的 endpoint，减少干扰
-  curl -fsS "${PG_URL%/}/metrics" | grep -E '^traffic_' | head -n 20 || {
-    log "No '^traffic_' lines found yet. The service may need a few seconds. Tail journal:"
-    journalctl -u "$UNIT_NAME" -n 30 --no-pager || true
-  }
+  log "Self-check: querying ${PG_URL}/metrics for '^traffic_' ..."
+  curl -fsS "${PG_URL%/}/metrics" | grep -E '^traffic_' | head -n 20 || true
 }
 
 uninstall_all() {
@@ -350,63 +285,31 @@ uninstall_all() {
   stop_disable_service || true
   remove_old_cron || true
   remove_files || true
-  log "Uninstalled. To remove metrics from Pushgateway, run with --clear-pg."
+  log "Uninstalled."
 }
 
 # ===== Main =====
 need_root
-
 EXISTING="$(detect_existing)"
 
 ACTION=""
-if [[ "$FLAG_UNINSTALL" == "true" ]]; then
-  ACTION="U"
-elif [[ "$FLAG_OVERWRITE" == "true" ]]; then
-  ACTION="O"
-elif [[ "$FLAG_KEEP" == "true" ]]; then
-  ACTION="K"
-fi
+if [[ "$FLAG_UNINSTALL" == "true" ]]; then ACTION="U"
+elif [[ "$FLAG_OVERWRITE" == "true" ]]; then ACTION="O"
+elif [[ "$FLAG_KEEP" == "true" ]]; then ACTION="K"; fi
 
 if [[ -z "$ACTION" ]]; then
   if [[ "$EXISTING" == "true" ]]; then
-    echo "Detected existing TrafficCop agent on this host."
-    echo "[O]verwrite (fresh install)  [K]eep (do nothing)  [U]ninstall"
+    echo "Detected existing TrafficCop agent."
+    echo "[O]verwrite / [K]eep / [U]ninstall"
     read -r -p "Choose action [O/K/U]: " ans || true
-    case "${ans^^}" in
-      O) ACTION="O" ;;
-      K) ACTION="K" ;;
-      U) ACTION="U" ;;
-      *) echo "No valid choice, abort."; exit 1;;
-    esac
-  else
-    ACTION="O"
-  fi
+    case "${ans^^}" in O) ACTION="O";; K) ACTION="K";; U) ACTION="U";; *) exit 1;; esac
+  else ACTION="O"; fi
 fi
 
 case "$ACTION" in
-  O)
-    install_or_overwrite
-    if [[ "$FLAG_CLEAR_PG" == "true" ]]; then
-      clear_pushgateway || true
-    fi
-    self_check
-    ;;
-  K)
-    log "Keep selected. No changes made."
-    if [[ "$FLAG_CLEAR_PG" == "true" ]]; then
-      clear_pushgateway || true
-    fi
-    ;;
-  U)
-    uninstall_all
-    if [[ "$FLAG_CLEAR_PG" == "true" ]]; then
-      clear_pushgateway || true
-    fi
-    ;;
-  *)
-    die "Unknown action."
-    ;;
+  O) install_or_overwrite; [[ "$FLAG_CLEAR_PG" == "true" ]] && clear_pushgateway; self_check;;
+  K) log "Keep selected."; [[ "$FLAG_CLEAR_PG" == "true" ]] && clear_pushgateway;;
+  U) uninstall_all; [[ "$FLAG_CLEAR_PG" == "true" ]] && clear_pushgateway;;
 esac
 
 log "Done."
-
