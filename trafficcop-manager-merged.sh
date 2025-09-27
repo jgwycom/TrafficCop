@@ -85,30 +85,35 @@ read -rp "流量配额 (GiB, 0=不限) [默认 $LIMIT_BYTES_DEFAULT]: " LIMIT_IN
 LIMIT_BYTES=$(awk "BEGIN {print (${LIMIT_INPUT:-$LIMIT_BYTES_DEFAULT} * 1024 * 1024 * 1024)}")
 
 #------------------------------
-# 自动推导 PANEL_API
+# 自动推导 PANEL_API（由 PG_URL 的主机拼成 18000 端口）
 #------------------------------
 PANEL_HOST=$(echo "$PG_URL_INPUT" | sed -E 's#^https?://([^:/]+).*#\1#')
 PANEL_API="http://${PANEL_HOST}:18000"
 log "自动推导 PANEL_API=$PANEL_API"
 
 #------------------------------
-# 唯一 NODE_ID 处理
+# 唯一 NODE_ID 处理（由面板分配，自增、终身不变）
 #------------------------------
 if [[ -f "$NODE_ID_FILE" ]]; then
   NODE_ID=$(cat "$NODE_ID_FILE")
   log "检测到已有 NODE_ID=$NODE_ID"
+  # 无论是否重装/改名，都把当前 INSTANCE / display_name 与该 NODE_ID 对齐
+  curl -s -X PATCH "$PANEL_API/nodes/$NODE_ID" \
+    -H "Content-Type: application/json" \
+    -d "{\"instance\":\"$INSTANCE\",\"display_name\":\"$INSTANCE\"}" >/dev/null || true
 else
   log "向面板机申请新的 NODE_ID..."
-  NODE_ID=$(curl -s -X POST "$PANEL_API/nodes" \
+  # 注册节点，要求面板返回 JSON 中包含 "id": <number>
+  CREATE_RESP=$(curl -sS -X POST "$PANEL_API/nodes" \
     -H "Content-Type: application/json" \
-    -d "{\"instance\":\"$INSTANCE\",\"display_name\":\"$INSTANCE\",\"sort_order\":0,\"reset_day\":$RESET_DAY,\"limit_bytes\":$LIMIT_BYTES,\"limit_mode\":\"double\",\"bandwidth_bps\":0}" \
-    | jq -r '.id // empty')
+    -d "{\"instance\":\"$INSTANCE\",\"display_name\":\"$INSTANCE\",\"sort_order\":0,\"reset_day\":$RESET_DAY,\"limit_bytes\":$LIMIT_BYTES,\"limit_mode\":\"double\",\"bandwidth_bps\":0}" || true)
 
-  if [[ -z "$NODE_ID" || "$NODE_ID" == "null" ]]; then
-    log "❌ 获取 NODE_ID 失败，请检查 PANEL_API 设置"
+  # 用 grep/sed 提取 id 数字，避免依赖 jq
+  NODE_ID=$(printf '%s' "$CREATE_RESP" | tr -d '\n' | grep -o '"id":[[:space:]]*[0-9]\+' | head -n1 | grep -o '[0-9]\+')
+  if [[ -z "$NODE_ID" ]]; then
+    log "❌ 获取 NODE_ID 失败（面板响应：$CREATE_RESP）"
     exit 1
   fi
-
   echo "$NODE_ID" > "$NODE_ID_FILE"
   log "已分配 NODE_ID=$NODE_ID"
 fi
@@ -134,10 +139,12 @@ read -rp "IFACES: " IFACES_INPUT
 IFACES="${IFACES_INPUT:-$DEFAULT_IFACE}"
 
 #------------------------------
-# 清理 PG 残余
+# 清理 PG 残余（不带 node_id 的路径）
 #------------------------------
 log "清理 Pushgateway 残余 (instance=$INSTANCE)"
 pg_delete_instance "$PG_URL_INPUT" "$JOB" "$INSTANCE"
+# 追加：清理带 node_id 的路径（防止历史残留）
+curl -s -X DELETE "$PG_URL_INPUT/metrics/job/$JOB/instance/$INSTANCE/node_id/$NODE_ID" >/dev/null || true
 
 #------------------------------
 # 写配置文件
@@ -186,10 +193,12 @@ while true; do
     echo "traffic_iface_up{iface=\"$IF\"} $STATE" >>"$METRICS_DIR/metrics.prom"
   done
 
+  # 作为独立指标保留（不删原逻辑）
   echo "node_id $NODE_ID" >>"$METRICS_DIR/metrics.prom"
 
+  # Push 到带 node_id 分组标签的路径，所有指标会带上 label node_id="<数字>"
   curl -s -X PUT --data-binary @"$METRICS_DIR/metrics.prom" \
-    "$PG_URL/metrics/job/$JOB/instance/$INSTANCE" || true
+    "$PG_URL/metrics/job/$JOB/instance/$INSTANCE/node_id/$NODE_ID" || true
 
   sleep "$INTERVAL"
 done
