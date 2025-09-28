@@ -63,6 +63,8 @@ while true; do
   if [[ "$INSTANCE" =~ ^[A-Za-z0-9._-]+$ ]]; then break; fi
   echo "❌ 无效的 INSTANCE，请重新输入"
 done
+read -rp "显示名称 (可选，默认=$INSTANCE): " DISPLAY_NAME_INPUT
+DISPLAY_NAME="${DISPLAY_NAME_INPUT:-$INSTANCE}"
 
 # PG_URL 优先取环境变量
 if [[ -n "${PG_URL:-}" ]]; then
@@ -100,20 +102,20 @@ if [[ -f "$NODE_ID_FILE" ]]; then
   # 无论是否重装/改名，都把当前 INSTANCE / display_name 与该 NODE_ID 对齐
   curl -s -X PATCH "$PANEL_API/nodes/$NODE_ID" \
     -H "Content-Type: application/json" \
-    -d "{\"instance\":\"$INSTANCE\",\"display_name\":\"$INSTANCE\"}" >/dev/null || true
+    -d "{\"instance\":\"$INSTANCE\",\"display_name\":\"$DISPLAY_NAME\"}" >/dev/null || true
 else
   log "向面板机申请新的 NODE_ID..."
   # 注册节点，要求面板返回 JSON 中包含 "id": <number>
   CREATE_RESP=$(curl -sS -X POST "$PANEL_API/nodes" \
     -H "Content-Type: application/json" \
-    -d "{\"instance\":\"$INSTANCE\",\"display_name\":\"$INSTANCE\",\"sort_order\":0,\"reset_day\":$RESET_DAY,\"limit_bytes\":$LIMIT_BYTES,\"limit_mode\":\"double\",\"bandwidth_bps\":0}" || true)
+    -d "{\"instance\":\"$INSTANCE\",\"display_name\":\"$DISPLAY_NAME\",\"sort_order\":0,\"reset_day\":$RESET_DAY,\"limit_bytes\":$LIMIT_BYTES,\"limit_mode\":\"double\",\"bandwidth_bps\":0}" || true)
 
   # 用 grep/sed 提取 id 数字，避免依赖 jq
   NODE_ID=$(printf '%s' "$CREATE_RESP" | tr -d '\n' | grep -o '"id":[[:space:]]*[0-9]\+' | head -n1 | grep -o '[0-9]\+')
-  if [[ -z "$NODE_ID" ]]; then
-    log "❌ 获取 NODE_ID 失败（面板响应：$CREATE_RESP）"
-    exit 1
-  fi
+if [[ -z "$NODE_ID" ]]; then
+  log "⚠️ 面板返回无效，临时设置 NODE_ID=0"
+  NODE_ID=0
+fi
   echo "$NODE_ID" > "$NODE_ID_FILE"
   log "已分配 NODE_ID=$NODE_ID"
 fi
@@ -232,11 +234,10 @@ log "已写入 systemd 单元 $SERVICE_FILE 并启动服务"
 # 自检 + 残余清理
 #------------------------------
 sleep 3
-if curl -s "$PG_URL_INPUT/metrics" | grep -q "instance=\"$INSTANCE\""; then
-  log "✅ 自检成功: $INSTANCE 已在 Pushgateway 注册"
-  pg_cleanup_all "$PG_URL_INPUT" "$JOB"
-  log "✅ 残余清理完成，Pushgateway 仅保留当前实例 $INSTANCE"
+if curl -s "$PG_URL_INPUT/metrics" | grep -q "instance=\"$INSTANCE\"" && \
+   curl -s "$PG_URL_INPUT/metrics" | grep -q "node_id=\"$NODE_ID\""; then
+    log "✅ 自检成功: $INSTANCE 已在 Pushgateway 注册 (node_id=$NODE_ID)"
 else
-  log "⚠️ 未检测到 $INSTANCE，请检查 agent 日志"
-  log "提示: 你可以尝试手工清理残余 -> curl -X DELETE $PG_URL_INPUT/metrics/job/$JOB/instance/$INSTANCE"
+    log "⚠️ 未检测到 $INSTANCE (node_id=$NODE_ID)，请检查 agent 日志"
 fi
+
