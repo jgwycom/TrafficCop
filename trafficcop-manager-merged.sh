@@ -234,10 +234,11 @@ log "已写入 systemd 单元 $SERVICE_FILE 并启动服务"
 # 自检 + 残余清理
 #------------------------------
 sleep 3
-if curl -s "$PG_URL_INPUT/metrics" | grep -q "instance=\"$INSTANCE\"" && \
-   curl -s "$PG_URL_INPUT/metrics" | grep -q "node_id=\"$NODE_ID\""; then
-    log "✅ 自检成功: $INSTANCE 已在 Pushgateway 注册 (node_id=$NODE_ID)"
+if curl -s "$PG_URL_INPUT/metrics" | grep -q "instance=\"$INSTANCE\".*node_id=\"$NODE_ID\""; then
+   log "✅ 自检成功: $INSTANCE (node_id=$NODE_ID) 已在 Pushgateway 注册"
 else
-    log "⚠️ 未检测到 $INSTANCE (node_id=$NODE_ID)，请检查 agent 日志"
+   log "⚠️ 未检测到 $INSTANCE (node_id=$NODE_ID)，请检查 agent 日志"
 fi
+
+
 
