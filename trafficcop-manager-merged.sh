@@ -200,7 +200,7 @@ while true; do
 
   # Push 到带 node_id 分组标签的路径，所有指标会带上 label node_id="<数字>"
   curl -s -X PUT --data-binary @"$METRICS_DIR/metrics.prom" \
-    "$PG_URL/metrics/job/$JOB/instance/$INSTANCE/node_id/$NODE_ID" || true
+    "$PG_URL/metrics/job/$JOB/node_id/$NODE_ID/instance/$INSTANCE" || true
 
   sleep "$INTERVAL"
 done
