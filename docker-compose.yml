@@ -1,0 +1,56 @@
+services:
+  grafana:
+    image: grafana/grafana:10.4.2
+    container_name: grafana
+    restart: always
+    ports:
+      - "3000:3000"
+    volumes:
+      - grafana_data:/var/lib/grafana
+    environment:
+      - GF_SECURITY_ADMIN_USER=admin
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+    ##  - GF_INSTALL_PLUGINS=yesoreyeram-infinity-datasource,yesoreyeram-button-panel
+    networks:
+      - trafficcop_net
+
+  prometheus:
+    image: prom/prometheus:v2.53.0
+    container_name: trafficcop-prometheus
+    restart: always
+    ports:
+      - "19090:9090"
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml
+    networks:
+      - trafficcop_net
+
+  pushgateway:
+    image: prom/pushgateway:v1.8.0
+    container_name: trafficcop-pushgateway
+    restart: always
+    ports:
+      - "19091:9091"
+    networks:
+      - trafficcop_net
+
+  trafficcop-panel:
+    build: .
+    container_name: trafficcop-panel
+    restart: always
+    ports:
+      - "18000:8000"
+    networks:
+      - trafficcop_net
+    volumes:
+      - ./app:/app
+      - ./data:/app/data   
+    env_file:
+      - ./settings.env
+
+
+networks:
+  trafficcop_net:
+    driver: bridge
+volumes:
+  grafana_data:
