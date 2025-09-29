@@ -26,6 +26,17 @@ install_agent() {
   OLD_CONF="/root/TrafficCop/traffic_monitor_config.txt"
   NODE_ID_FILE="/etc/trafficcop-nodeid"
 
+# =============================================================================
+#                       ①b 卸载 Agent（新增）
+# =============================================================================
+uninstall_agent() {
+  root
+  systemctl disable --now trafficcop-agent 2>/dev/null || true
+  rm -f /etc/systemd/system/trafficcop-agent.service
+  rm -rf /opt/trafficcop-agent /etc/trafficcop-agent.env /etc/trafficcop-nodeid
+  systemctl daemon-reload
+  log "✅ 已卸载 TrafficCop Agent"
+}
   #------------------------------
   # 清理指定 instance
   #------------------------------
@@ -339,22 +350,24 @@ menu() {
   clear
   echo -e "\e[36m============ TrafficCop 管理面板 V3 ============\e[0m"
   echo "1. 安装/升级 节点 Agent（节点机用）"
-  echo "2. 安装/升级 面板栈（面板机用）"
-  echo "3. 卸载面板/监控栈（不删数据）"
-  echo "4. 查看状态"
-  echo "5. 配置 Telegram 推送"
-  echo "6. 调整每日任务时间"
-  echo "7. 退出"
+  echo "2. 卸载 节点 Agent（节点机用）"
+  echo "3. 安装/升级 面板栈（面板机用）"
+  echo "4. 卸载 面板/监控栈（不删数据）"
+  echo "5. 查看状态"
+  echo "6. 配置 Telegram 推送"
+  echo "7. 调整每日任务时间"
+  echo "8. 退出"
   echo "============================================"
   read -rp "请输入选项: " num
   case "$num" in
     1) install_agent ;;
-    2) install_or_upgrade_stack ;;
-    3) systemctl disable --now trafficcop-reset.timer ;;
-    4) systemctl status trafficcop-agent --no-pager; systemctl status trafficcop-reset.timer --no-pager ;;
-    5) read -rp "TG_BOT_TOKEN: " t; read -rp "TG_CHAT_ID: " c; echo "TG_BOT_TOKEN=$t" >/etc/trafficcop/telegram.env; echo "TG_CHAT_ID=$c" >>/etc/trafficcop/telegram.env ;;
-    6) read -rp "请输入新 OnCalendar (默认 00:10:00): " t; t="${t:-00:10:00}"; sed -i "s|OnCalendar=.*|OnCalendar=*-*-* $t|" /etc/systemd/system/trafficcop-reset.timer; systemctl daemon-reload; systemctl restart trafficcop-reset.timer ;;
-    7) exit 0 ;;
+    2) uninstall_agent ;;
+    3) install_or_upgrade_stack ;;
+    4) systemctl disable --now trafficcop-reset.timer ;;
+    5) systemctl status trafficcop-agent --no-pager; systemctl status trafficcop-reset.timer --no-pager ;;
+    6) read -rp "TG_BOT_TOKEN: " t; read -rp "TG_CHAT_ID: " c; echo "TG_BOT_TOKEN=$t" >/etc/trafficcop/telegram.env; echo "TG_CHAT_ID=$c" >>/etc/trafficcop/telegram.env ;;
+    7) read -rp "请输入新 OnCalendar (默认 00:10:00): " t; t="${t:-00:10:00}"; sed -i "s|OnCalendar=.*|OnCalendar=*-*-* $t|" /etc/systemd/system/trafficcop-reset.timer; systemctl daemon-reload; systemctl restart trafficcop-reset.timer ;;
+    8) exit 0 ;;
     *) echo "输入错误"; sleep 1; menu ;;
   esac
 }
