@@ -399,14 +399,18 @@ menu() {
        log "✅ 已写入 Telegram 配置并安装 tg_notifier.sh"
        menu
        ;;
-    7)
-       read -rp "请输入新 OnCalendar (默认 00:10:00): " t; t="${t:-00:10:00}"
-       sed -i "s|OnCalendar=.*|OnCalendar=*-*-* $t|" /etc/systemd/system/trafficcop-reset.timer
-       systemctl daemon-reload
-       systemctl restart trafficcop-reset.timer
-       log "✅ 已更新 reset.timer 执行时间"
-       menu
-       ;;
+7)
+   if [[ ! -f /etc/systemd/system/trafficcop-reset.timer ]]; then
+     warn "未检测到 reset.timer，请先在面板机运行安装/升级面板栈"
+   else
+     read -rp "请输入新 OnCalendar (默认 00:10:00): " t; t="${t:-00:10:00}"
+     sed -i "s|OnCalendar=.*|OnCalendar=*-*-* $t|" /etc/systemd/system/trafficcop-reset.timer
+     systemctl daemon-reload
+     systemctl restart trafficcop-reset.timer
+     log "✅ 已更新 reset.timer 执行时间"
+   fi
+   menu
+   ;;
     8) uninstall_all ;;
     9) exit 0 ;;
     *) echo "输入错误"; sleep 1; menu ;;
