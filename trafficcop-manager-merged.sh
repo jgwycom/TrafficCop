@@ -1,10 +1,9 @@
 #!/usr/bin/env bash
+# V3
 # trafficcop-manager-merged.sh
-# =============== 整合版（菜单专用） ===============
-# 1) 保留原有 Agent 安装逻辑
-# 2) 使用本地 /www/trafficcop-panel 作为面板目录
-# 3) 加 systemd reset 双保险
-# 4) 始终进入菜单，不再一键执行
+# =============== 节点/面板分离版 ===============
+# - 节点机：安装/升级 Agent
+# - 面板机：安装/升级 面板栈 (docker-compose)
 # ===============================================
 
 set -Eeuo pipefail
@@ -112,6 +111,7 @@ install_agent() {
   #------------------------------
   # 唯一 NODE_ID 处理
   #------------------------------
+  NODE_ID=""
   if [[ -f "$NODE_ID_FILE" ]]; then
     NODE_ID=$(cat "$NODE_ID_FILE")
     log "检测到已有 NODE_ID=$NODE_ID"
@@ -260,8 +260,9 @@ EOF
 }
 
 # =============================================================================
-#                       ② 面板部署（本地 /www/trafficcop-panel）
+#                       ② 面板栈安装逻辑（面板机用）
 # =============================================================================
+REPO_RAW="https://raw.githubusercontent.com/jgwycom/TrafficCop/main"
 INSTALL_DIR="/www/trafficcop-panel"
 DB_DIR="$INSTALL_DIR/data"
 DB_PATH="$DB_DIR/trafficcop.db"
@@ -269,36 +270,25 @@ ENV_PATH="$INSTALL_DIR/settings.env"
 
 install_or_upgrade_stack() {
   root
-  if [[ -f "$INSTALL_DIR/docker-compose.yml" ]]; then
-    log "使用本地 $INSTALL_DIR/docker-compose.yml"
-  else
-    err "未找到 $INSTALL_DIR/docker-compose.yml"
-  fi
-  if [[ -f "$ENV_PATH" ]]; then
-    log "使用本地 $ENV_PATH"
-  else
-    err "未找到 $ENV_PATH"
-  fi
-  if [[ -f "$INSTALL_DIR/app.py" ]]; then
-    log "使用本地 $INSTALL_DIR/app.py"
-  else
-    err "未找到 $INSTALL_DIR/app.py"
-  fi
-  if [[ -f "$INSTALL_DIR/trafficcop.json" ]]; then
-    log "使用本地 $INSTALL_DIR/trafficcop.json"
-  else
-    err "未找到 $INSTALL_DIR/trafficcop.json"
+  need curl
+  mkdir -p "$INSTALL_DIR" "$DB_DIR"
+
+  log "从仓库获取最新面板与编排文件..."
+  curl -fsSL "$REPO_RAW/docker-compose.yml" -o "$INSTALL_DIR/docker-compose.yml"
+  curl -fsSL "$REPO_RAW/app.py" -o "$INSTALL_DIR/app.py"
+  curl -fsSL "$REPO_RAW/trafficcop.json" -o "$INSTALL_DIR/trafficcop.json"
+  if ! [[ -f "$ENV_PATH" ]]; then
+    curl -fsSL "$REPO_RAW/settings.env" -o "$ENV_PATH"
   fi
 
-  # docker-compose 启动
   if command -v docker >/dev/null 2>&1; then
     (cd "$INSTALL_DIR" && docker compose up -d || docker-compose up -d)
   else
-    warn "未安装 docker；已跳过容器编排"
+    warn "未安装 docker；请手动启动面板栈"
   fi
 
   setup_systemd_reset_timer
-  log "面板/监控栈启动完成 ✅"
+  log "面板/监控栈安装或升级完成 ✅"
 }
 
 # =============================================================================
@@ -347,22 +337,24 @@ EOF
 # =============================================================================
 menu() {
   clear
-  echo -e "\e[36m============ TrafficCop 管理面板 ============\e[0m"
-  echo "1. 安装/升级（Agent + 面板栈 + systemd 双保险）"
-  echo "2. 卸载面板/监控栈（不删数据）"
-  echo "3. 查看状态"
-  echo "4. 配置 Telegram 推送"
-  echo "5. 调整每日任务时间"
-  echo "6. 退出"
+  echo -e "\e[36m============ TrafficCop 管理面板 V3 ============\e[0m"
+  echo "1. 安装/升级 节点 Agent（节点机用）"
+  echo "2. 安装/升级 面板栈（面板机用）"
+  echo "3. 卸载面板/监控栈（不删数据）"
+  echo "4. 查看状态"
+  echo "5. 配置 Telegram 推送"
+  echo "6. 调整每日任务时间"
+  echo "7. 退出"
   echo "============================================"
   read -rp "请输入选项: " num
   case "$num" in
-    1) install_agent; install_or_upgrade_stack ;;
-    2) systemctl disable --now trafficcop-reset.timer ;;
-    3) systemctl status trafficcop-agent --no-pager; systemctl status trafficcop-reset.timer --no-pager ;;
-    4) read -rp "TG_BOT_TOKEN: " t; read -rp "TG_CHAT_ID: " c; echo "TG_BOT_TOKEN=$t" >/etc/trafficcop/telegram.env; echo "TG_CHAT_ID=$c" >>/etc/trafficcop/telegram.env ;;
-    5) read -rp "请输入新 OnCalendar (默认 00:10:00): " t; t="${t:-00:10:00}"; sed -i "s|OnCalendar=.*|OnCalendar=*-*-* $t|" /etc/systemd/system/trafficcop-reset.timer; systemctl daemon-reload; systemctl restart trafficcop-reset.timer ;;
-    6) exit 0 ;;
+    1) install_agent ;;
+    2) install_or_upgrade_stack ;;
+    3) systemctl disable --now trafficcop-reset.timer ;;
+    4) systemctl status trafficcop-agent --no-pager; systemctl status trafficcop-reset.timer --no-pager ;;
+    5) read -rp "TG_BOT_TOKEN: " t; read -rp "TG_CHAT_ID: " c; echo "TG_BOT_TOKEN=$t" >/etc/trafficcop/telegram.env; echo "TG_CHAT_ID=$c" >>/etc/trafficcop/telegram.env ;;
+    6) read -rp "请输入新 OnCalendar (默认 00:10:00): " t; t="${t:-00:10:00}"; sed -i "s|OnCalendar=.*|OnCalendar=*-*-* $t|" /etc/systemd/system/trafficcop-reset.timer; systemctl daemon-reload; systemctl restart trafficcop-reset.timer ;;
+    7) exit 0 ;;
     *) echo "输入错误"; sleep 1; menu ;;
   esac
 }
