@@ -368,8 +368,8 @@ menu() {
   echo "5. 查看状态"
   echo "6. 配置 Telegram 推送"
   echo "7. 调整每日任务时间"
-  echo "8. 退出"
-  echo "9. ⚠️ 完全卸载（Agent + 面板栈 + 数据目录）"
+  echo "8. ⚠️ 完全卸载（Agent + 面板栈 + 数据目录）"
+  echo "9. 退出"
   echo "============================================"
   read -rp "请输入选项: " num
   case "$num" in
@@ -407,8 +407,8 @@ menu() {
        log "✅ 已更新 reset.timer 执行时间"
        menu
        ;;
-    8) exit 0 ;;
-    9) uninstall_all ;;
+    8) uninstall_all ;;
+    9) exit 0 ;;
     *) echo "输入错误"; sleep 1; menu ;;
   esac
 }
