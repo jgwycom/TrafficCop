@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
-# V3
+# V4
 # trafficcop-manager-merged.sh
 # =============== 节点/面板分离版 ===============
-# - 节点机：安装/升级 Agent
-# - 面板机：安装/升级 面板栈 (docker-compose)
+# - 节点机：安装/升级/卸载 Agent
+# - 面板机：安装/升级/卸载 面板栈 (docker-compose)
+# - 新增：完全卸载（Agent + 面板栈 + 数据目录）
 # ===============================================
 
 set -Eeuo pipefail
@@ -26,17 +27,6 @@ install_agent() {
   OLD_CONF="/root/TrafficCop/traffic_monitor_config.txt"
   NODE_ID_FILE="/etc/trafficcop-nodeid"
 
-# =============================================================================
-#                       ①b 卸载 Agent（新增）
-# =============================================================================
-uninstall_agent() {
-  root
-  systemctl disable --now trafficcop-agent 2>/dev/null || true
-  rm -f /etc/systemd/system/trafficcop-agent.service
-  rm -rf /opt/trafficcop-agent /etc/trafficcop-agent.env /etc/trafficcop-nodeid
-  systemctl daemon-reload
-  log "✅ 已卸载 TrafficCop Agent"
-}
   #------------------------------
   # 清理指定 instance
   #------------------------------
@@ -264,10 +254,13 @@ EOF
   #------------------------------
   sleep 3
   if curl -s "$PG_URL_INPUT/metrics" | grep -q "instance=\"$INSTANCE\".*node_id=\"$NODE_ID\""; then
-    log "✅ 自检成功: $INSTANCE (node_id=$NODE_ID) 已在 Pushgateway 注册"
+     log "✅ 自检成功: $INSTANCE (node_id=$NODE_ID) 已在 Pushgateway 注册"
   else
-    log "⚠️ 未检测到 $INSTANCE (node_id=$NODE_ID)，请检查 agent 日志"
+     warn "未在 Pushgateway 检测到 $INSTANCE (node_id=$NODE_ID)，可能需要等待一段时间"
   fi
+
+  # 安装完成后回到菜单
+  menu
 }
 
 # =============================================================================
@@ -300,6 +293,9 @@ install_or_upgrade_stack() {
 
   setup_systemd_reset_timer
   log "面板/监控栈安装或升级完成 ✅"
+
+  # 安装完成后回到菜单
+  menu
 }
 
 # =============================================================================
@@ -344,11 +340,27 @@ EOF
 }
 
 # =============================================================================
-#                                ④ 菜单
+#                       ④ 完全卸载（新增）
+# =============================================================================
+uninstall_all() {
+  root
+  log "⚠️ 将卸载 Agent + 面板栈 + 数据目录..."
+  systemctl disable --now trafficcop-agent 2>/dev/null || true
+  systemctl disable --now trafficcop-reset.timer 2>/dev/null || true
+  rm -f /etc/systemd/system/trafficcop-agent.service
+  rm -f /etc/systemd/system/trafficcop-reset.{service,timer}
+  systemctl daemon-reload
+  rm -rf /opt/trafficcop-agent /etc/trafficcop-agent.env /etc/trafficcop-nodeid /etc/trafficcop /www/trafficcop-panel
+  log "✅ 已完成完全卸载（Agent + 面板栈 + 数据目录已清理）"
+  menu
+}
+
+# =============================================================================
+#                                ⑤ 菜单
 # =============================================================================
 menu() {
   clear
-  echo -e "\e[36m============ TrafficCop 管理面板 V3 ============\e[0m"
+  echo -e "\e[36m============ TrafficCop 管理面板 V4 ============\e[0m"
   echo "1. 安装/升级 节点 Agent（节点机用）"
   echo "2. 卸载 节点 Agent（节点机用）"
   echo "3. 安装/升级 面板栈（面板机用）"
@@ -357,17 +369,46 @@ menu() {
   echo "6. 配置 Telegram 推送"
   echo "7. 调整每日任务时间"
   echo "8. 退出"
+  echo "9. ⚠️ 完全卸载（Agent + 面板栈 + 数据目录）"
   echo "============================================"
   read -rp "请输入选项: " num
   case "$num" in
     1) install_agent ;;
     2) uninstall_agent ;;
     3) install_or_upgrade_stack ;;
-    4) systemctl disable --now trafficcop-reset.timer ;;
-    5) systemctl status trafficcop-agent --no-pager; systemctl status trafficcop-reset.timer --no-pager ;;
-    6) read -rp "TG_BOT_TOKEN: " t; read -rp "TG_CHAT_ID: " c; echo "TG_BOT_TOKEN=$t" >/etc/trafficcop/telegram.env; echo "TG_CHAT_ID=$c" >>/etc/trafficcop/telegram.env ;;
-    7) read -rp "请输入新 OnCalendar (默认 00:10:00): " t; t="${t:-00:10:00}"; sed -i "s|OnCalendar=.*|OnCalendar=*-*-* $t|" /etc/systemd/system/trafficcop-reset.timer; systemctl daemon-reload; systemctl restart trafficcop-reset.timer ;;
+    4) systemctl disable --now trafficcop-reset.timer; menu ;;
+    5)
+       systemctl status trafficcop-agent --no-pager || true
+       if systemctl list-unit-files | grep -q trafficcop-reset.timer; then
+         systemctl status trafficcop-reset.timer --no-pager || true
+       else
+         echo "节点机未启用 reset.timer"
+       fi
+       read -rp "按回车返回菜单..." _
+       menu
+       ;;
+    6)
+       root
+       mkdir -p /etc/trafficcop
+       read -rp "TG_BOT_TOKEN: " t
+       read -rp "TG_CHAT_ID: " c
+       echo "TG_BOT_TOKEN=$t" >/etc/trafficcop/telegram.env
+       echo "TG_CHAT_ID=$c" >>/etc/trafficcop/telegram.env
+       curl -fsSL "$REPO_RAW/tg_notifier.sh" -o /opt/trafficcop-agent/tg_notifier.sh
+       chmod +x /opt/trafficcop-agent/tg_notifier.sh
+       log "✅ 已写入 Telegram 配置并安装 tg_notifier.sh"
+       menu
+       ;;
+    7)
+       read -rp "请输入新 OnCalendar (默认 00:10:00): " t; t="${t:-00:10:00}"
+       sed -i "s|OnCalendar=.*|OnCalendar=*-*-* $t|" /etc/systemd/system/trafficcop-reset.timer
+       systemctl daemon-reload
+       systemctl restart trafficcop-reset.timer
+       log "✅ 已更新 reset.timer 执行时间"
+       menu
+       ;;
     8) exit 0 ;;
+    9) uninstall_all ;;
     *) echo "输入错误"; sleep 1; menu ;;
   esac
 }
