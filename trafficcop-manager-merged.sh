@@ -402,12 +402,14 @@ menu() {
 7)
    if [[ ! -f /etc/systemd/system/trafficcop-reset.timer ]]; then
      warn "未检测到 reset.timer，请先在面板机运行安装/升级面板栈"
+     read -rp "按回车返回菜单..." _
    else
      read -rp "请输入新 OnCalendar (默认 00:10:00): " t; t="${t:-00:10:00}"
      sed -i "s|OnCalendar=.*|OnCalendar=*-*-* $t|" /etc/systemd/system/trafficcop-reset.timer
      systemctl daemon-reload
      systemctl restart trafficcop-reset.timer
      log "✅ 已更新 reset.timer 执行时间"
+     read -rp "按回车返回菜单..." _
    fi
    menu
    ;;
