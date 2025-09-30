@@ -96,7 +96,7 @@ install_agent() {
   read -rp "推送间隔秒 [默认 10]: " INTERVAL_INPUT
   INTERVAL="${INTERVAL_INPUT:-10}"
 
-  read -rp "每月重置日 (1-28) [默认 $RESET_DAY_DEFAULT]: " RESET_DAY_INPUT
+  read -rp "每月重置日 (1-31) [默认 $RESET_DAY_DEFAULT]: " RESET_DAY_INPUT
   RESET_DAY="${RESET_DAY_INPUT:-$RESET_DAY_DEFAULT}"
 
   read -rp "流量配额 (GiB, 0=不限) [默认 $LIMIT_BYTES_DEFAULT]: " LIMIT_INPUT
@@ -421,3 +421,4 @@ menu() {
 
 # 始终进入菜单
 menu
+
