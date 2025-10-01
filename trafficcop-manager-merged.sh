@@ -188,7 +188,8 @@ EOF
   #------------------------------
   # 写 agent.sh
   #------------------------------
-  cat >"$AGENT_DIR/agent.sh" <<'EOS'
+ # 写 agent.sh
+cat >"$AGENT_DIR/agent.sh" <<'EOS'
 #!/usr/bin/env bash
 set -Eeuo pipefail
 source /etc/trafficcop-agent.env
@@ -196,6 +197,7 @@ METRICS_DIR="/run/trafficcop"
 
 while true; do
   : >"$METRICS_DIR/metrics.prom"
+  CURRENT_DATE=$(date +%Y-%m-%d)
   {
     echo "# HELP traffic_rx_bytes_total Total received bytes."
     echo "# TYPE traffic_rx_bytes_total untyped"
@@ -211,8 +213,8 @@ while true; do
     RX=$(cat /sys/class/net/$IF/statistics/rx_bytes 2>/dev/null || echo 0)
     TX=$(cat /sys/class/net/$IF/statistics/tx_bytes 2>/dev/null || echo 0)
     STATE=$(cat /sys/class/net/$IF/operstate 2>/dev/null | grep -q up && echo 1 || echo 0)
-    echo "traffic_rx_bytes_total{iface=\"$IF\"} $RX" >>"$METRICS_DIR/metrics.prom"
-    echo "traffic_tx_bytes_total{iface=\"$IF\"} $TX" >>"$METRICS_DIR/metrics.prom"
+    echo "traffic_rx_bytes_total{iface=\"$IF\",date=\"$CURRENT_DATE\"} $RX" >>"$METRICS_DIR/metrics.prom"
+    echo "traffic_tx_bytes_total{iface=\"$IF\",date=\"$CURRENT_DATE\"} $TX" >>"$METRICS_DIR/metrics.prom"
     echo "traffic_iface_up{iface=\"$IF\"} $STATE" >>"$METRICS_DIR/metrics.prom"
   done
 
@@ -421,4 +423,3 @@ menu() {
 
 # 始终进入菜单
 menu
-
