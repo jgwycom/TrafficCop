@@ -55,52 +55,72 @@ install_agent() {
   }
 
   #------------------------------
-  # 迁移助手
+  # 默认值迁移
   #------------------------------
   RESET_DAY_DEFAULT="1"
   LIMIT_BYTES_DEFAULT="0"
+  BANDWIDTH_MBPS_DEFAULT="0"
+
+  # 从旧版配置迁移
   if [[ -f "$OLD_CONF" ]]; then
     log "检测到旧版配置 $OLD_CONF，尝试读取 ..."
     RESET_DAY_DEFAULT=$(grep -E '^RESET_DAY=' "$OLD_CONF" | cut -d= -f2 || echo "1")
     LIMIT_BYTES_DEFAULT=$(grep -E '^LIMIT_BYTES=' "$OLD_CONF" | cut -d= -f2 || echo "0")
-    log "迁移默认值: RESET_DAY=$RESET_DAY_DEFAULT, LIMIT_BYTES=$LIMIT_BYTES_DEFAULT"
   fi
 
+  # 从现有 ENV 读取旧值
+  if [[ -f "$ENV_FILE" ]]; then
+    source "$ENV_FILE"
+    RESET_DAY_DEFAULT="${RESET_DAY:-$RESET_DAY_DEFAULT}"
+    LIMIT_BYTES_DEFAULT="$(awk "BEGIN {print (${LIMIT_BYTES:-0}/1024/1024/1024)}")"
+    BANDWIDTH_MBPS_DEFAULT="$(awk "BEGIN {print (${BANDWIDTH_BPS:-0}/1000000)}")"
+  fi
   #------------------------------
-  # 交互输入
+  # 交互输入（带默认值）
   #------------------------------
   echo "=============================="
   echo "请输入当前节点的唯一标识 INSTANCE"
   echo "⚠️ 必须唯一，仅允许字母/数字/点/横杠/下划线"
   echo "示例：node-01, db_02, proxy-kr.03"
   echo "=============================="
-  while true; do
-    read -rp "INSTANCE: " INSTANCE
-    if [[ "$INSTANCE" =~ ^[A-Za-z0-9._-]+$ ]]; then break; fi
-    echo "❌ 无效的 INSTANCE，请重新输入"
-  done
-  read -rp "显示名称 (可选，默认=$INSTANCE): " DISPLAY_NAME_INPUT
-  DISPLAY_NAME="${DISPLAY_NAME_INPUT:-$INSTANCE}"
+  read -rp "INSTANCE [默认 ${INSTANCE:-}]: " INSTANCE_INPUT
+  INSTANCE="${INSTANCE_INPUT:-${INSTANCE:-}}"
+  [[ -z "$INSTANCE" ]] && { echo "❌ INSTANCE 不能为空"; exit 1; }
 
-  # PG_URL 优先取环境变量
+  read -rp "显示名称 (可选，默认=${DISPLAY_NAME:-$INSTANCE}): " DISPLAY_NAME_INPUT
+  DISPLAY_NAME="${DISPLAY_NAME_INPUT:-${DISPLAY_NAME:-$INSTANCE}}"
+
   if [[ -n "${PG_URL:-}" ]]; then
     PG_URL_INPUT="$PG_URL"
   else
-    read -rp "Pushgateway 地址 (必填): " PG_URL_INPUT
+    read -rp "Pushgateway 地址 [默认 ${PG_URL_INPUT:-}]: " PG_URL_TMP
+    PG_URL_INPUT="${PG_URL_TMP:-${PG_URL_INPUT:-}}"
     [[ -z "$PG_URL_INPUT" ]] && { echo "❌ PG_URL 不能为空"; exit 1; }
   fi
 
-  read -rp "Job 名称 [默认 trafficcop]: " JOB_INPUT
-  JOB="${JOB_INPUT:-trafficcop}"
+  read -rp "Job 名称 [默认 ${JOB:-trafficcop}]: " JOB_INPUT
+  JOB="${JOB_INPUT:-${JOB:-trafficcop}}"
 
-  read -rp "推送间隔秒 [默认 10]: " INTERVAL_INPUT
-  INTERVAL="${INTERVAL_INPUT:-10}"
+  read -rp "推送间隔秒 [默认 ${INTERVAL:-10}]: " INTERVAL_INPUT
+  INTERVAL="${INTERVAL_INPUT:-${INTERVAL:-10}}"
 
   read -rp "每月重置日 (1-31) [默认 $RESET_DAY_DEFAULT]: " RESET_DAY_INPUT
   RESET_DAY="${RESET_DAY_INPUT:-$RESET_DAY_DEFAULT}"
 
   read -rp "流量配额 (GiB, 0=不限) [默认 $LIMIT_BYTES_DEFAULT]: " LIMIT_INPUT
   LIMIT_BYTES=$(awk "BEGIN {print (${LIMIT_INPUT:-$LIMIT_BYTES_DEFAULT} * 1024 * 1024 * 1024)}")
+
+  # 新增带宽指标
+  read -rp "带宽上限 (Mbps, 0=不限) [默认 $BANDWIDTH_MBPS_DEFAULT]: " BW_INPUT
+  BANDWIDTH_MBPS="${BW_INPUT:-$BANDWIDTH_MBPS_DEFAULT}"
+  BANDWIDTH_BPS=$(awk "BEGIN {print $BANDWIDTH_MBPS * 1000000}")
+
+  #------------------------------
+  # 自动推导 PANEL_API (保持原样)
+  #------------------------------
+  PANEL_HOST=$(echo "$PG_URL_INPUT" | sed -E 's#^https?://([^:/]+).*#\1#')
+  PANEL_API="http://${PANEL_HOST}:18000"
+  log "自动推导 PANEL_API=$PANEL_API"
 
   #------------------------------
   # 自动推导 PANEL_API
@@ -127,8 +147,8 @@ install_agent() {
   if [[ -z "${NODE_ID:-}" ]]; then
     log "向面板机申请新的 NODE_ID..."
     CREATE_RESP=$(curl -sS -X POST "$PANEL_API/nodes" \
-      -H "Content-Type: application/json" \
-      -d "{\"instance\":\"$INSTANCE\",\"display_name\":\"$DISPLAY_NAME\",\"sort_order\":0,\"reset_day\":$RESET_DAY,\"limit_bytes\":$LIMIT_BYTES,\"limit_mode\":\"double\",\"bandwidth_bps\":0}" || true)
+  -H "Content-Type: application/json" \
+  -d "{\"instance\":\"$INSTANCE\",\"display_name\":\"$DISPLAY_NAME\",\"sort_order\":0,\"reset_day\":$RESET_DAY,\"limit_bytes\":$LIMIT_BYTES,\"limit_mode\":\"double\",\"bandwidth_bps\":$BANDWIDTH_BPS}" || true)
     NODE_ID=$(printf '%s' "$CREATE_RESP" | tr -d '\n' | grep -o '"id":[[:space:]]*[0-9]\+' | head -n1 | grep -o '[0-9]\+')
     if [[ -z "$NODE_ID" ]]; then
       log "⚠️ 面板返回无效，临时设置 NODE_ID=0"
@@ -137,9 +157,9 @@ install_agent() {
     echo "$NODE_ID" > "$NODE_ID_FILE"
     log "已分配 NODE_ID=$NODE_ID"
   else
-    curl -s -X PATCH "$PANEL_API/nodes/$NODE_ID" \
-      -H "Content-Type: application/json" \
-      -d "{\"instance\":\"$INSTANCE\",\"display_name\":\"$DISPLAY_NAME\"}" >/dev/null || true
+   curl -s -X PATCH "$PANEL_API/nodes/$NODE_ID" \
+  -H "Content-Type: application/json" \
+  -d "{\"instance\":\"$INSTANCE\",\"display_name\":\"$DISPLAY_NAME\",\"reset_day\":$RESET_DAY,\"limit_bytes\":$LIMIT_BYTES,\"bandwidth_bps\":$BANDWIDTH_BPS}" >/dev/null || true
   fi
 
   #------------------------------
@@ -182,7 +202,9 @@ IFACES="$IFACES"
 RESET_DAY=$RESET_DAY
 LIMIT_BYTES=$LIMIT_BYTES
 NODE_ID=$NODE_ID
+BANDWIDTH_BPS=$BANDWIDTH_BPS
 EOF
+
   log "已写入配置 $ENV_FILE"
 
   #------------------------------
