@@ -1,0 +1,300 @@
+{
+  "annotations": {
+    "list": [
+      {
+        "builtIn": 1,
+        "datasource": {
+          "type": "grafana",
+          "uid": "-- Grafana --"
+        },
+        "enable": true,
+        "hide": true,
+        "iconColor": "rgba(0, 211, 255, 1)",
+        "name": "Annotations & Alerts",
+        "type": "dashboard"
+      }
+    ]
+  },
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 0,
+  "id": null,
+  "links": [],
+  "panels": [
+    {
+      "datasource": "${DS_PROM}",
+      "fieldConfig": {
+        "defaults": {
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": 0 },
+              { "color": "red", "value": 80 }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 6, "w": 6, "x": 0, "y": 0 },
+      "id": 1,
+      "options": {
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "center",
+        "orientation": "auto",
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }
+      },
+      "pluginVersion": "12.2.0",
+      "targets": [
+        {
+          "expr": "sum((time() - max by (instance) (push_time_seconds{job=\"trafficcop\"})) < bool 120)",
+          "instant": true,
+          "refId": "A"
+        }
+      ],
+      "title": "在线节点数（2分钟内有上报）",
+      "type": "stat"
+    },
+    {
+      "datasource": "${DS_PROM}",
+      "gridPos": { "h": 6, "w": 6, "x": 6, "y": 0 },
+      "id": 7,
+      "options": {
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "center",
+        "orientation": "auto",
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }
+      },
+      "targets": [
+        {
+          "expr": "count(count by (instance) (traffic_rx_bytes_total{job=\"trafficcop\"}))",
+          "instant": true,
+          "refId": "A"
+        }
+      ],
+      "title": "注册节点总数（观测到的 instance）",
+      "type": "stat"
+    },
+    {
+      "datasource": "${DS_PROM}",
+      "gridPos": { "h": 6, "w": 12, "x": 12, "y": 0 },
+      "id": 2,
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "center",
+        "orientation": "auto",
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }
+      },
+      "targets": [
+        {
+          "expr": "sum(8*rate(traffic_rx_bytes_total{job=\"trafficcop\"}[$__rate_interval]) + 8*rate(traffic_tx_bytes_total{job=\"trafficcop\"}[$__rate_interval]))",
+          "legendFormat": "Total bps",
+          "refId": "A"
+        }
+      ],
+      "title": "全网总带宽（bps）",
+      "type": "stat"
+    },
+    {
+      "datasource": "${DS_PROM}",
+      "gridPos": { "h": 10, "w": 24, "x": 0, "y": 6 },
+      "id": 3,
+      "targets": [
+        {
+          "expr": "sum by (instance) (8*rate(traffic_rx_bytes_total{job=\"trafficcop\",instance=~\"$node\",iface=~\"$iface\"}[$__rate_interval]) + 8*rate(traffic_tx_bytes_total{job=\"trafficcop\",instance=~\"$node\",iface=~\"$iface\"}[$__rate_interval]))",
+          "legendFormat": "{{instance}}",
+          "refId": "A"
+        }
+      ],
+      "title": "各节点总带宽（bps）",
+      "type": "timeseries"
+    },
+    {
+      "datasource": "${DS_PROM}",
+      "gridPos": { "h": 10, "w": 12, "x": 0, "y": 16 },
+      "id": 4,
+      "options": {
+        "showHeader": true
+      },
+      "targets": [
+        {
+          "expr": "topk(10, sum by (instance) (8*rate(traffic_rx_bytes_total{job=\"trafficcop\"}[1m]) + 8*rate(traffic_tx_bytes_total{job=\"trafficcop\"}[1m])))",
+          "format": "table",
+          "instant": true,
+          "legendFormat": "{{instance}}",
+          "refId": "A"
+        }
+      ],
+      "title": "Top10 当前带宽（bps）",
+      "type": "table"
+    },
+    {
+      "datasource": "${DS_PROM}",
+      "gridPos": { "h": 10, "w": 12, "x": 12, "y": 16 },
+      "id": 5,
+      "options": { "showHeader": true },
+      "targets": [
+        {
+          "expr": "100 * sum by (instance) (increase(traffic_rx_bytes_total{job=\"trafficcop\"}[$__range]) + increase(traffic_tx_bytes_total{job=\"trafficcop\"}[$__range])) / on(instance) group_left traffic_limit_bytes{job=\"trafficcop\"}",
+          "format": "table",
+          "instant": true,
+          "legendFormat": "{{instance}} 利用率(%)",
+          "refId": "A"
+        }
+      ],
+      "transformations": [
+        {
+          "id": "organize",
+          "options": {
+            "excludeByName": {},
+            "indexByName": {},
+            "renameByName": {
+              "Value": "利用率(%)"
+            }
+          }
+        }
+      ],
+      "title": "配额利用率（按选择时间段）",
+      "type": "table"
+    },
+    {
+      "datasource": "${DS_PROM}",
+      "gridPos": { "h": 12, "w": 24, "x": 0, "y": 26 },
+      "id": 6,
+      "targets": [
+        {
+          "expr": "8*rate(traffic_tx_bytes_total{job=\"trafficcop\",instance=~\"$node\",iface=~\"$iface\"}[$__rate_interval])",
+          "legendFormat": "TX {{instance}} {{iface}}",
+          "refId": "TX"
+        },
+        {
+          "expr": "8*rate(traffic_rx_bytes_total{job=\"trafficcop\",instance=~\"$node\",iface=~\"$iface\"}[$__rate_interval])",
+          "legendFormat": "RX {{instance}} {{iface}}",
+          "refId": "RX"
+        }
+      ],
+      "title": "选定节点/网卡 上/下行（bps）",
+      "type": "timeseries"
+    },
+    {
+      "datasource": "${DS_PROM}",
+      "gridPos": { "h": 10, "w": 12, "x": 0, "y": 38 },
+      "id": 8,
+      "options": { "showHeader": true },
+      "targets": [
+        {
+          "expr": "sum by (instance) (increase(traffic_rx_bytes_total{job=\"trafficcop\"}[$__range]) + increase(traffic_tx_bytes_total{job=\"trafficcop\"}[$__range]))",
+          "format": "table",
+          "instant": true,
+          "legendFormat": "{{instance}}",
+          "refId": "A"
+        },
+        {
+          "expr": "traffic_limit_bytes{job=\"trafficcop\"}",
+          "format": "table",
+          "instant": true,
+          "legendFormat": "{{instance}} 配额",
+          "refId": "B"
+        }
+      ],
+      "title": "月度用量（字节）与配额（若已上报）",
+      "type": "table",
+      "transformations": [
+        { "id": "merge", "options": {} },
+        {
+          "id": "calculateField",
+          "options": {
+            "alias": "利用率(%)",
+            "binary": {
+              "left": "Value (A)",
+              "operator": "/",
+              "right": "Value (B)"
+            },
+            "mode": "binary",
+            "replaceFields": false
+          }
+        },
+        {
+          "id": "calculateField",
+          "options": {
+            "alias": "利用率(%)",
+            "mode": "reduceRow",
+            "reduce": { "reducer": "mean" },
+            "replaceFields": false
+          }
+        }
+      ]
+    },
+    {
+      "datasource": "${DS_PROM}",
+      "gridPos": { "h": 10, "w": 12, "x": 12, "y": 38 },
+      "id": 9,
+      "options": { "showHeader": true },
+      "targets": [
+        {
+          "expr": "topk(10, 100 * sum by (instance) (increase(traffic_rx_bytes_total{job=\"trafficcop\"}[$__range]) + increase(traffic_tx_bytes_total{job=\"trafficcop\"}[$__range])) / on(instance) group_left traffic_limit_bytes{job=\"trafficcop\"})",
+          "format": "table",
+          "instant": true,
+          "legendFormat": "{{instance}}",
+          "refId": "A"
+        }
+      ],
+      "title": "配额超额风险 Top10（按所选时间范围）",
+      "type": "table"
+    },
+    {
+      "datasource": "${DS_PROM}",
+      "gridPos": { "h": 10, "w": 24, "x": 0, "y": 48 },
+      "id": 10,
+      "options": { "legend": { "displayMode": "list" } },
+      "targets": [
+        {
+          "expr": "topk(10, sum by (instance) (increase(traffic_rx_bytes_total{job=\"trafficcop\"}[24h]) + increase(traffic_tx_bytes_total{job=\"trafficcop\"}[24h])))",
+          "legendFormat": "{{instance}}",
+          "refId": "A"
+        }
+      ],
+      "title": "近24小时总流量 Top10（B）",
+      "type": "bargauge"
+    }
+  ],
+  "templating": {
+    "list": [
+      {
+        "name": "DS_PROM",
+        "type": "datasource",
+        "query": "prometheus",
+        "refresh": 1,
+        "current": {}
+      },
+      {
+        "name": "node",
+        "type": "query",
+        "datasource": "${DS_PROM}",
+        "includeAll": true,
+        "multi": true,
+        "allValue": ".*",
+        "refresh": 2,
+        "query": "label_values(traffic_rx_bytes_total{job=\"trafficcop\"}[5m], instance)"
+      },
+      {
+        "name": "iface",
+        "type": "query",
+        "datasource": "${DS_PROM}",
+        "includeAll": true,
+        "multi": true,
+        "allValue": ".*",
+        "refresh": 2,
+        "query": "label_values(traffic_tx_bytes_total{job=\"trafficcop\",instance=~\"$node\"}, iface)"
+      }
+    ]
+  },
+  "time": { "from": "now-6h", "to": "now" },
+  "timezone": "browser",
+  "title": "TrafficCop 多节点流量监控面板 v3 (enhanced)",
+  "version": 2,
+  "schemaVersion": 42
+}
