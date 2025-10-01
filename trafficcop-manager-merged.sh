@@ -176,17 +176,17 @@ install_agent() {
   #------------------------------
   install -d -m 755 "$AGENT_DIR" "$METRICS_DIR"
   cat >"$ENV_FILE" <<EOF
-PG_URL=$PG_URL_INPUT
-JOB=$JOB
-INSTANCE=$INSTANCE
-INTERVAL=$INTERVAL
-IFACES="$IFACES"
-RESET_DAY=$RESET_DAY
-LIMIT_BYTES=$LIMIT_BYTES
-NODE_ID=$NODE_ID
-BANDWIDTH_BPS=$BANDWIDTH_BPS
-LIMIT_MODE=$LIMIT_MODE_STR
-EOF
+  PG_URL=$PG_URL_INPUT
+  JOB=$JOB
+  INSTANCE=$INSTANCE
+  INTERVAL=$INTERVAL
+  IFACES="$IFACES"
+  RESET_DAY=$RESET_DAY
+  LIMIT_BYTES=$LIMIT_BYTES
+  NODE_ID=$NODE_ID
+  BANDWIDTH_BPS=$BANDWIDTH_BPS
+  LIMIT_MODE=$LIMIT_MODE_STR
+  EOF
   log "已写入配置 $ENV_FILE"
 
   #------------------------------
@@ -264,6 +264,9 @@ EOF
   else
      warn "未在 Pushgateway 检测到 $INSTANCE (node_id=$NODE_ID)，可能需要等待一段时间"
   fi
+if [[ -x /opt/trafficcop-agent/tg_notifier.sh ]]; then
+    /opt/trafficcop-agent/tg_notifier.sh "✅ 面板/监控栈安装或升级完成\n主机: $(hostname) 已安装完成，并注册到面板。"
+fi
 
   # 安装完成后回到菜单
   menu
@@ -296,6 +299,9 @@ install_or_upgrade_stack() {
   else
     warn "未安装 docker；请手动启动面板栈"
   fi
+if [[ -x /opt/trafficcop-agent/tg_notifier.sh ]]; then
+    /opt/trafficcop-agent/tg_notifier.sh "✅ 面板/监控栈安装或升级完成"
+fi
 
   setup_systemd_reset_timer
   log "面板/监控栈安装或升级完成 ✅"
