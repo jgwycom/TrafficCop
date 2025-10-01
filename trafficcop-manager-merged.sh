@@ -69,12 +69,15 @@ install_agent() {
   fi
 
   # 从现有 ENV 读取旧值
-  if [[ -f "$ENV_FILE" ]]; then
-    source "$ENV_FILE"
-    RESET_DAY_DEFAULT="${RESET_DAY:-$RESET_DAY_DEFAULT}"
-    LIMIT_BYTES_DEFAULT="$(awk "BEGIN {print (${LIMIT_BYTES:-0}/1024/1024/1024)}")"
-    BANDWIDTH_MBPS_DEFAULT="$(awk "BEGIN {print (${BANDWIDTH_BPS:-0}/1000000)}")"
-  fi
+if [[ -f "$ENV_FILE" ]]; then
+  source "$ENV_FILE"
+  RESET_DAY_DEFAULT="${RESET_DAY:-$RESET_DAY_DEFAULT}"
+  LIMIT_BYTES_DEFAULT="$(awk "BEGIN {print (${LIMIT_BYTES:-0}/1024/1024/1024)}")"
+  BANDWIDTH_MBPS_DEFAULT="$(awk "BEGIN {print (${BANDWIDTH_BPS:-0}/1000000)}")"
+  LIMIT_MODE_DEFAULT="${LIMIT_MODE:-1}"
+else
+  LIMIT_MODE_DEFAULT="1"
+fi
   #------------------------------
   # 交互输入（带默认值）
   #------------------------------
@@ -110,10 +113,13 @@ install_agent() {
   read -rp "流量配额 (GiB, 0=不限) [默认 $LIMIT_BYTES_DEFAULT]: " LIMIT_INPUT
   LIMIT_BYTES=$(awk "BEGIN {print (${LIMIT_INPUT:-$LIMIT_BYTES_DEFAULT} * 1024 * 1024 * 1024)}")
 
-  # 新增带宽指标
   read -rp "带宽上限 (Mbps, 0=不限) [默认 $BANDWIDTH_MBPS_DEFAULT]: " BW_INPUT
   BANDWIDTH_MBPS="${BW_INPUT:-$BANDWIDTH_MBPS_DEFAULT}"
   BANDWIDTH_BPS=$(awk "BEGIN {print $BANDWIDTH_MBPS * 1000000}")
+
+  echo "限流模式 (1=双向, 2=仅上行, 3=仅下行)"
+  read -rp "请选择限流模式 [默认 $LIMIT_MODE_DEFAULT]: " LIMIT_MODE_INPUT
+  LIMIT_MODE="${LIMIT_MODE_INPUT:-$LIMIT_MODE_DEFAULT}"
 
   #------------------------------
   # 自动推导 PANEL_API (保持原样)
@@ -148,7 +154,7 @@ install_agent() {
     log "向面板机申请新的 NODE_ID..."
     CREATE_RESP=$(curl -sS -X POST "$PANEL_API/nodes" \
   -H "Content-Type: application/json" \
-  -d "{\"instance\":\"$INSTANCE\",\"display_name\":\"$DISPLAY_NAME\",\"sort_order\":0,\"reset_day\":$RESET_DAY,\"limit_bytes\":$LIMIT_BYTES,\"limit_mode\":\"double\",\"bandwidth_bps\":$BANDWIDTH_BPS}" || true)
+  -d "{\"instance\":\"$INSTANCE\",\"display_name\":\"$DISPLAY_NAME\",\"sort_order\":0,\"reset_day\":$RESET_DAY,\"limit_bytes\":$LIMIT_BYTES,\"limit_mode\":$LIMIT_MODE,\"bandwidth_bps\":$BANDWIDTH_BPS}"
     NODE_ID=$(printf '%s' "$CREATE_RESP" | tr -d '\n' | grep -o '"id":[[:space:]]*[0-9]\+' | head -n1 | grep -o '[0-9]\+')
     if [[ -z "$NODE_ID" ]]; then
       log "⚠️ 面板返回无效，临时设置 NODE_ID=0"
@@ -159,7 +165,7 @@ install_agent() {
   else
    curl -s -X PATCH "$PANEL_API/nodes/$NODE_ID" \
   -H "Content-Type: application/json" \
-  -d "{\"instance\":\"$INSTANCE\",\"display_name\":\"$DISPLAY_NAME\",\"reset_day\":$RESET_DAY,\"limit_bytes\":$LIMIT_BYTES,\"bandwidth_bps\":$BANDWIDTH_BPS}" >/dev/null || true
+    -d "{\"instance\":\"$INSTANCE\",\"display_name\":\"$DISPLAY_NAME\",\"reset_day\":$RESET_DAY,\"limit_bytes\":$LIMIT_BYTES,\"limit_mode\":$LIMIT_MODE,\"bandwidth_bps\":$BANDWIDTH_BPS}" >/dev/null || true
   fi
 
   #------------------------------
@@ -203,6 +209,7 @@ RESET_DAY=$RESET_DAY
 LIMIT_BYTES=$LIMIT_BYTES
 NODE_ID=$NODE_ID
 BANDWIDTH_BPS=$BANDWIDTH_BPS
+LIMIT_MODE=$LIMIT_MODE
 EOF
 
   log "已写入配置 $ENV_FILE"
