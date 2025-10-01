@@ -28,30 +28,11 @@ install_agent() {
   NODE_ID_FILE="/etc/trafficcop-nodeid"
 
   #------------------------------
-  # 清理指定 instance
+  # 清理函数
   #------------------------------
   pg_delete_instance() {
     local pg_url="$1" job="$2" inst="$3"
     curl -s -X DELETE "${pg_url}/metrics/job/${job}/instance/${inst}" >/dev/null || true
-  }
-
-  #------------------------------
-  # 全量清理 job 残余
-  #------------------------------
-  pg_cleanup_all() {
-    local pg_url="$1" job="$2"
-    log "检测并清理 $job 下的残余 instance ..."
-    INSTANCES=$(curl -s "$pg_url/metrics" | grep "job=\"$job\"" | sed -n 's/.*instance=\"\([^\"]*\)\".*/\1/p' | sort -u || true)
-    if [[ -z "$INSTANCES" ]]; then
-      log "未发现残余 instance"
-      return
-    fi
-    for inst in $INSTANCES; do
-      if [[ "$inst" != "$INSTANCE" ]]; then
-        log "清理旧残余 instance=$inst"
-        curl -s -X DELETE "$pg_url/metrics/job/$job/instance/$inst" >/dev/null || true
-      fi
-    done
   }
 
   #------------------------------
@@ -60,6 +41,7 @@ install_agent() {
   RESET_DAY_DEFAULT="1"
   LIMIT_BYTES_DEFAULT="0"
   BANDWIDTH_MBPS_DEFAULT="0"
+  LIMIT_MODE_DEFAULT="1" # 1=双向, 2=上行, 3=下行
 
   # 从旧版配置迁移
   if [[ -f "$OLD_CONF" ]]; then
@@ -69,17 +51,16 @@ install_agent() {
   fi
 
   # 从现有 ENV 读取旧值
-if [[ -f "$ENV_FILE" ]]; then
-  source "$ENV_FILE"
-  RESET_DAY_DEFAULT="${RESET_DAY:-$RESET_DAY_DEFAULT}"
-  LIMIT_BYTES_DEFAULT="$(awk "BEGIN {print (${LIMIT_BYTES:-0}/1024/1024/1024)}")"
-  BANDWIDTH_MBPS_DEFAULT="$(awk "BEGIN {print (${BANDWIDTH_BPS:-0}/1000000)}")"
-  LIMIT_MODE_DEFAULT="${LIMIT_MODE:-1}"
-else
-  LIMIT_MODE_DEFAULT="1"
-fi
+  if [[ -f "$ENV_FILE" ]]; then
+    source "$ENV_FILE"
+    RESET_DAY_DEFAULT="${RESET_DAY:-$RESET_DAY_DEFAULT}"
+    LIMIT_BYTES_DEFAULT="$(awk "BEGIN {print (${LIMIT_BYTES:-0}/1024/1024/1024)}")"
+    BANDWIDTH_MBPS_DEFAULT="$(awk "BEGIN {print (${BANDWIDTH_BPS:-0}/1000000)}")"
+    LIMIT_MODE_DEFAULT="${LIMIT_MODE:-double}"
+  fi
+
   #------------------------------
-  # 交互输入（带默认值）
+  # 交互输入
   #------------------------------
   echo "=============================="
   echo "请输入当前节点的唯一标识 INSTANCE"
@@ -121,12 +102,13 @@ fi
   read -rp "请选择限流模式 [默认 $LIMIT_MODE_DEFAULT]: " LIMIT_MODE_INPUT
   LIMIT_MODE="${LIMIT_MODE_INPUT:-$LIMIT_MODE_DEFAULT}"
 
-  #------------------------------
-  # 自动推导 PANEL_API (保持原样)
-  #------------------------------
-  PANEL_HOST=$(echo "$PG_URL_INPUT" | sed -E 's#^https?://([^:/]+).*#\1#')
-  PANEL_API="http://${PANEL_HOST}:18000"
-  log "自动推导 PANEL_API=$PANEL_API"
+  # 数字/字符串映射
+  case "$LIMIT_MODE" in
+    1|"double") LIMIT_MODE_STR="double" ;;   # 双向
+    2|"upload") LIMIT_MODE_STR="upload" ;;   # 上行
+    3|"download") LIMIT_MODE_STR="download" ;; # 下行
+    *) LIMIT_MODE_STR="double" ;;
+  esac
 
   #------------------------------
   # 自动推导 PANEL_API
@@ -136,7 +118,7 @@ fi
   log "自动推导 PANEL_API=$PANEL_API"
 
   #------------------------------
-  # 唯一 NODE_ID 处理
+  # 唯一 NODE_ID 处理（保持原有逻辑）
   #------------------------------
   NODE_ID=""
   if [[ -f "$NODE_ID_FILE" ]]; then
@@ -153,8 +135,8 @@ fi
   if [[ -z "${NODE_ID:-}" ]]; then
     log "向面板机申请新的 NODE_ID..."
     CREATE_RESP=$(curl -sS -X POST "$PANEL_API/nodes" \
-  -H "Content-Type: application/json" \
-  -d "{\"instance\":\"$INSTANCE\",\"display_name\":\"$DISPLAY_NAME\",\"sort_order\":0,\"reset_day\":$RESET_DAY,\"limit_bytes\":$LIMIT_BYTES,\"limit_mode\":$LIMIT_MODE,\"bandwidth_bps\":$BANDWIDTH_BPS}"
+      -H "Content-Type: application/json" \
+      -d "{\"instance\":\"$INSTANCE\",\"display_name\":\"$DISPLAY_NAME\",\"sort_order\":0,\"reset_day\":$RESET_DAY,\"limit_bytes\":$LIMIT_BYTES,\"limit_mode\":\"$LIMIT_MODE_STR\",\"bandwidth_bps\":$BANDWIDTH_BPS}" || true)
     NODE_ID=$(printf '%s' "$CREATE_RESP" | tr -d '\n' | grep -o '"id":[[:space:]]*[0-9]\+' | head -n1 | grep -o '[0-9]\+')
     if [[ -z "$NODE_ID" ]]; then
       log "⚠️ 面板返回无效，临时设置 NODE_ID=0"
@@ -163,22 +145,16 @@ fi
     echo "$NODE_ID" > "$NODE_ID_FILE"
     log "已分配 NODE_ID=$NODE_ID"
   else
-   curl -s -X PATCH "$PANEL_API/nodes/$NODE_ID" \
-  -H "Content-Type: application/json" \
-    -d "{\"instance\":\"$INSTANCE\",\"display_name\":\"$DISPLAY_NAME\",\"reset_day\":$RESET_DAY,\"limit_bytes\":$LIMIT_BYTES,\"limit_mode\":$LIMIT_MODE,\"bandwidth_bps\":$BANDWIDTH_BPS}" >/dev/null || true
+    curl -s -X PATCH "$PANEL_API/nodes/$NODE_ID" \
+      -H "Content-Type: application/json" \
+      -d "{\"instance\":\"$INSTANCE\",\"display_name\":\"$DISPLAY_NAME\",\"reset_day\":$RESET_DAY,\"limit_bytes\":$LIMIT_BYTES,\"limit_mode\":\"$LIMIT_MODE_STR\",\"bandwidth_bps\":$BANDWIDTH_BPS}" >/dev/null || true
   fi
 
   #------------------------------
-  # 网卡选择
+  # 网卡选择 (保持原有逻辑)
   #------------------------------
   AVAILABLE_IFACES=$(ls /sys/class/net | grep -Ev '^(lo|docker.*|veth.*)$')
-  DEFAULT_IFACE=""
-  if echo "$AVAILABLE_IFACES" | grep -qw "eth0"; then
-    DEFAULT_IFACE="eth0"
-  else
-    DEFAULT_IFACE=$(echo "$AVAILABLE_IFACES" | head -n1)
-  fi
-
+  DEFAULT_IFACE=$(echo "$AVAILABLE_IFACES" | grep -qw "eth0" && echo "eth0" || echo "$(echo "$AVAILABLE_IFACES" | head -n1)")
   echo "=============================="
   echo "检测到以下网络接口:"
   echo "$AVAILABLE_IFACES"
@@ -196,7 +172,7 @@ fi
   curl -s -X DELETE "$PG_URL_INPUT/metrics/job/$JOB/instance/$INSTANCE/node_id/$NODE_ID" >/dev/null || true
 
   #------------------------------
-  # 写配置文件
+  # 写配置文件 (新增 LIMIT_MODE)
   #------------------------------
   install -d -m 755 "$AGENT_DIR" "$METRICS_DIR"
   cat >"$ENV_FILE" <<EOF
@@ -209,9 +185,8 @@ RESET_DAY=$RESET_DAY
 LIMIT_BYTES=$LIMIT_BYTES
 NODE_ID=$NODE_ID
 BANDWIDTH_BPS=$BANDWIDTH_BPS
-LIMIT_MODE=$LIMIT_MODE
+LIMIT_MODE=$LIMIT_MODE_STR
 EOF
-
   log "已写入配置 $ENV_FILE"
 
   #------------------------------
