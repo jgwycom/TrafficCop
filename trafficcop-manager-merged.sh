@@ -213,7 +213,9 @@ while true; do
     echo "# TYPE node_id gauge"
   } >"$METRICS_DIR/metrics.prom"
 
-  for IF in $IFACES; do
+  # 安全处理：如果 IFACES 为空则使用默认值
+  ACTUAL_IFACES="${IFACES:-eth0}"
+  for IF in $ACTUAL_IFACES; do
     RX=$(cat /sys/class/net/$IF/statistics/rx_bytes 2>/dev/null || echo 0)
     TX=$(cat /sys/class/net/$IF/statistics/tx_bytes 2>/dev/null || echo 0)
     STATE=$(cat /sys/class/net/$IF/operstate 2>/dev/null | grep -q up && echo 1 || echo 0)
