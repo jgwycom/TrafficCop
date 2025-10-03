@@ -10,7 +10,8 @@ services:
     environment:
       - GF_SECURITY_ADMIN_USER=admin
       - GF_SECURITY_ADMIN_PASSWORD=admin
-    ##  - GF_INSTALL_PLUGINS=yesoreyeram-infinity-datasource,yesoreyeram-button-panel
+      - GF_SECURITY_DISABLE_SANITIZE_HTML=true   # ✅ 允许 <iframe>/<script>
+      - GF_INSTALL_PLUGINS=yesoreyeram-infinity-datasource,yesoreyeram-button-panel   # ✅ 自动安装 Infinity 和 Button 插件
     networks:
       - trafficcop_net
 
