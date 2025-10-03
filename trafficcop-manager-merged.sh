@@ -36,79 +36,113 @@ install_agent() {
   }
 
   #------------------------------
-  # 默认值迁移
+  # 默认值初始化
   #------------------------------
   RESET_DAY_DEFAULT="1"
   LIMIT_BYTES_DEFAULT="0"
   BANDWIDTH_MBPS_DEFAULT="0"
-  LIMIT_MODE_DEFAULT="1" # 1=双向, 2=上行, 3=下行
+  LIMIT_MODE_DEFAULT="double"
 
-  # 从旧版配置迁移
-  if [[ -f "$OLD_CONF" ]]; then
-    log "检测到旧版配置 $OLD_CONF，尝试读取 ..."
-    RESET_DAY_DEFAULT=$(grep -E '^RESET_DAY=' "$OLD_CONF" | cut -d= -f2 || echo "1")
-    LIMIT_BYTES_DEFAULT=$(grep -E '^LIMIT_BYTES=' "$OLD_CONF" | cut -d= -f2 || echo "0")
-  fi
-
-  # 从现有 ENV 读取旧值
+  #------------------------------
+  # 从现有 ENV 文件读取旧值（优先）
+  #------------------------------
   if [[ -f "$ENV_FILE" ]]; then
+    log "检测到现有配置文件 $ENV_FILE，读取旧值..."
+    # 临时取消错误设置以安全source
+    set +u
     source "$ENV_FILE"
-    RESET_DAY_DEFAULT="${RESET_DAY:-$RESET_DAY_DEFAULT}"
-    LIMIT_BYTES_DEFAULT="$(awk "BEGIN {print (${LIMIT_BYTES:-0}/1024/1024/1024)}")"
-    BANDWIDTH_MBPS_DEFAULT="$(awk "BEGIN {print (${BANDWIDTH_BPS:-0}/1000000)}")"
+    set -u
+    
+    # 设置默认值为现有值
+    INSTANCE_DEFAULT="${INSTANCE:-}"
+    DISPLAY_NAME_DEFAULT="${DISPLAY_NAME:-${INSTANCE_DEFAULT}}"
+    PG_URL_DEFAULT="${PG_URL:-}"
+    JOB_DEFAULT="${JOB:-trafficcop}"
+    INTERVAL_DEFAULT="${INTERVAL:-10}"
+    RESET_DAY_DEFAULT="${RESET_DAY:-1}"
+    LIMIT_BYTES_GB_DEFAULT=$(awk "BEGIN {printf \"%.0f\", (${LIMIT_BYTES:-0}/1024/1024/1024)}")
+    BANDWIDTH_MBPS_DEFAULT=$(awk "BEGIN {printf \"%.0f\", (${BANDWIDTH_BPS:-0}/1000000)}")
     LIMIT_MODE_DEFAULT="${LIMIT_MODE:-double}"
+    IFACES_DEFAULT="${IFACES:-eth0}"
+  else
+    # 从旧版配置迁移
+    if [[ -f "$OLD_CONF" ]]; then
+      log "检测到旧版配置 $OLD_CONF，尝试读取..."
+      set +u
+      source "$OLD_CONF"
+      set -u
+      RESET_DAY_DEFAULT="${RESET_DAY:-1}"
+      LIMIT_BYTES_GB_DEFAULT=$(awk "BEGIN {printf \"%.0f\", (${LIMIT_BYTES:-0}/1024/1024/1024)}")
+    fi
+    
+    # 新安装的默认值
+    INSTANCE_DEFAULT=""
+    DISPLAY_NAME_DEFAULT=""
+    PG_URL_DEFAULT=""
+    JOB_DEFAULT="trafficcop"
+    INTERVAL_DEFAULT="10"
+    RESET_DAY_DEFAULT="${RESET_DAY_DEFAULT:-1}"
+    LIMIT_BYTES_GB_DEFAULT="${LIMIT_BYTES_GB_DEFAULT:-0}"
+    BANDWIDTH_MBPS_DEFAULT="0"
+    LIMIT_MODE_DEFAULT="double"
+    IFACES_DEFAULT="eth0"
   fi
 
   #------------------------------
-  # 交互输入
+  # 交互输入（显示旧值作为默认）
   #------------------------------
   echo "=============================="
   echo "请输入当前节点的唯一标识 INSTANCE"
   echo "⚠️ 必须唯一，仅允许字母/数字/点/横杠/下划线"
   echo "示例：node-01, db_02, proxy-kr.03"
   echo "=============================="
-  read -rp "INSTANCE [默认 ${INSTANCE:-}]: " INSTANCE_INPUT
-  INSTANCE="${INSTANCE_INPUT:-${INSTANCE:-}}"
+  read -rp "INSTANCE [默认 ${INSTANCE_DEFAULT}]: " INSTANCE_INPUT
+  INSTANCE="${INSTANCE_INPUT:-$INSTANCE_DEFAULT}"
   [[ -z "$INSTANCE" ]] && { echo "❌ INSTANCE 不能为空"; exit 1; }
 
-  read -rp "显示名称 (可选，默认=${DISPLAY_NAME:-$INSTANCE}): " DISPLAY_NAME_INPUT
-  DISPLAY_NAME="${DISPLAY_NAME_INPUT:-${DISPLAY_NAME:-$INSTANCE}}"
+  read -rp "显示名称 (可选，默认=${DISPLAY_NAME_DEFAULT}): " DISPLAY_NAME_INPUT
+  DISPLAY_NAME="${DISPLAY_NAME_INPUT:-$DISPLAY_NAME_DEFAULT}"
 
-  if [[ -n "${PG_URL:-}" ]]; then
-    PG_URL_INPUT="$PG_URL"
+  if [[ -n "${PG_URL_DEFAULT:-}" ]]; then
+    PG_URL_INPUT="$PG_URL_DEFAULT"
   else
-    read -rp "Pushgateway 地址 [默认 ${PG_URL_INPUT:-}]: " PG_URL_TMP
-    PG_URL_INPUT="${PG_URL_TMP:-${PG_URL_INPUT:-}}"
+    read -rp "Pushgateway 地址 [默认 ${PG_URL_DEFAULT:-}]: " PG_URL_TMP
+    PG_URL_INPUT="${PG_URL_TMP:-${PG_URL_DEFAULT:-}}"
     [[ -z "$PG_URL_INPUT" ]] && { echo "❌ PG_URL 不能为空"; exit 1; }
   fi
 
-  read -rp "Job 名称 [默认 ${JOB:-trafficcop}]: " JOB_INPUT
-  JOB="${JOB_INPUT:-${JOB:-trafficcop}}"
+  read -rp "Job 名称 [默认 ${JOB_DEFAULT}]: " JOB_INPUT
+  JOB="${JOB_INPUT:-$JOB_DEFAULT}"
 
-  read -rp "推送间隔秒 [默认 ${INTERVAL:-10}]: " INTERVAL_INPUT
-  INTERVAL="${INTERVAL_INPUT:-${INTERVAL:-10}}"
+  read -rp "推送间隔秒 [默认 ${INTERVAL_DEFAULT}]: " INTERVAL_INPUT
+  INTERVAL="${INTERVAL_INPUT:-$INTERVAL_DEFAULT}"
 
   read -rp "每月重置日 (1-31) [默认 $RESET_DAY_DEFAULT]: " RESET_DAY_INPUT
   RESET_DAY="${RESET_DAY_INPUT:-$RESET_DAY_DEFAULT}"
 
-  read -rp "流量配额 (GiB, 0=不限) [默认 $LIMIT_BYTES_DEFAULT]: " LIMIT_INPUT
-  LIMIT_BYTES=$(awk "BEGIN {print (${LIMIT_INPUT:-$LIMIT_BYTES_DEFAULT} * 1024 * 1024 * 1024)}")
+  read -rp "流量配额 (GiB, 0=不限) [默认 $LIMIT_BYTES_GB_DEFAULT]: " LIMIT_INPUT
+  LIMIT_BYTES=$(awk "BEGIN {print (${LIMIT_INPUT:-$LIMIT_BYTES_GB_DEFAULT} * 1024 * 1024 * 1024)}")
 
   read -rp "带宽上限 (Mbps, 0=不限) [默认 $BANDWIDTH_MBPS_DEFAULT]: " BW_INPUT
   BANDWIDTH_MBPS="${BW_INPUT:-$BANDWIDTH_MBPS_DEFAULT}"
   BANDWIDTH_BPS=$(awk "BEGIN {print $BANDWIDTH_MBPS * 1000000}")
 
-  echo "限流模式 (1=双向, 2=仅上行, 3=仅下行)"
+  echo "限流模式 (double=双向, upload=仅上行, download=仅下行)"
   read -rp "请选择限流模式 [默认 $LIMIT_MODE_DEFAULT]: " LIMIT_MODE_INPUT
   LIMIT_MODE="${LIMIT_MODE_INPUT:-$LIMIT_MODE_DEFAULT}"
 
-  # 数字/字符串映射
-  case "$LIMIT_MODE" in
-    1|"double") LIMIT_MODE_STR="double" ;;   # 双向
-    2|"upload") LIMIT_MODE_STR="upload" ;;   # 上行
-    3|"download") LIMIT_MODE_STR="download" ;; # 下行
-    *) LIMIT_MODE_STR="double" ;;
-  esac
+  # 网卡选择（显示旧值）
+  AVAILABLE_IFACES=$(ls /sys/class/net | grep -Ev '^(lo|docker.*|veth.*)$')
+  DEFAULT_IFACE="${IFACES_DEFAULT:-$(echo "$AVAILABLE_IFACES" | grep -qw "eth0" && echo "eth0" || echo "$(echo "$AVAILABLE_IFACES" | head -n1)")}"
+  
+  echo "=============================="
+  echo "检测到以下网络接口:"
+  echo "$AVAILABLE_IFACES"
+  echo "请输入需要监控的接口（可输入多个，以空格分隔）"
+  echo "直接回车则默认使用: $DEFAULT_IFACE"
+  echo "=============================="
+  read -rp "IFACES: " IFACES_INPUT
+  IFACES="${IFACES_INPUT:-$DEFAULT_IFACE}"
 
   #------------------------------
   # 自动推导 PANEL_API
@@ -136,7 +170,7 @@ install_agent() {
     log "向面板机申请新的 NODE_ID..."
     CREATE_RESP=$(curl -sS -X POST "$PANEL_API/nodes" \
       -H "Content-Type: application/json" \
-      -d "{\"instance\":\"$INSTANCE\",\"display_name\":\"$DISPLAY_NAME\",\"sort_order\":0,\"reset_day\":$RESET_DAY,\"limit_bytes\":$LIMIT_BYTES,\"limit_mode\":\"$LIMIT_MODE_STR\",\"bandwidth_bps\":$BANDWIDTH_BPS}" || true)
+      -d "{\"instance\":\"$INSTANCE\",\"display_name\":\"$DISPLAY_NAME\",\"sort_order\":0,\"reset_day\":$RESET_DAY,\"limit_bytes\":$LIMIT_BYTES,\"limit_mode\":\"$LIMIT_MODE\",\"bandwidth_bps\":$BANDWIDTH_BPS}" || true)
     NODE_ID=$(printf '%s' "$CREATE_RESP" | tr -d '\n' | grep -o '"id":[[:space:]]*[0-9]\+' | head -n1 | grep -o '[0-9]\+')
     if [[ -z "$NODE_ID" ]]; then
       log "⚠️ 面板返回无效，临时设置 NODE_ID=0"
@@ -147,22 +181,8 @@ install_agent() {
   else
     curl -s -X PATCH "$PANEL_API/nodes/$NODE_ID" \
       -H "Content-Type: application/json" \
-      -d "{\"instance\":\"$INSTANCE\",\"display_name\":\"$DISPLAY_NAME\",\"reset_day\":$RESET_DAY,\"limit_bytes\":$LIMIT_BYTES,\"limit_mode\":\"$LIMIT_MODE_STR\",\"bandwidth_bps\":$BANDWIDTH_BPS}" >/dev/null || true
+      -d "{\"instance\":\"$INSTANCE\",\"display_name\":\"$DISPLAY_NAME\",\"reset_day\":$RESET_DAY,\"limit_bytes\":$LIMIT_BYTES,\"limit_mode\":\"$LIMIT_MODE\",\"bandwidth_bps\":$BANDWIDTH_BPS}" >/dev/null || true
   fi
-
-  #------------------------------
-  # 网卡选择 (保持原有逻辑)
-  #------------------------------
-  AVAILABLE_IFACES=$(ls /sys/class/net | grep -Ev '^(lo|docker.*|veth.*)$')
-  DEFAULT_IFACE=$(echo "$AVAILABLE_IFACES" | grep -qw "eth0" && echo "eth0" || echo "$(echo "$AVAILABLE_IFACES" | head -n1)")
-  echo "=============================="
-  echo "检测到以下网络接口:"
-  echo "$AVAILABLE_IFACES"
-  echo "请输入需要监控的接口（可输入多个，以空格分隔）"
-  echo "直接回车则默认使用: $DEFAULT_IFACE"
-  echo "=============================="
-  read -rp "IFACES: " IFACES_INPUT
-  IFACES="${IFACES_INPUT:-$DEFAULT_IFACE}"
 
   #------------------------------
   # 清理 PG 残余
@@ -172,28 +192,27 @@ install_agent() {
   curl -s -X DELETE "$PG_URL_INPUT/metrics/job/$JOB/instance/$INSTANCE/node_id/$NODE_ID" >/dev/null || true
 
   #------------------------------
-  # 写配置文件 (新增 LIMIT_MODE)
+  # 写配置文件
   #------------------------------
   install -d -m 755 "$AGENT_DIR" "$METRICS_DIR"
   cat >"$ENV_FILE" <<EOF
-  PG_URL=$PG_URL_INPUT
-  JOB=$JOB
-  INSTANCE=$INSTANCE
-  INTERVAL=$INTERVAL
-  IFACES="$IFACES"
-  RESET_DAY=$RESET_DAY
-  LIMIT_BYTES=$LIMIT_BYTES
-  NODE_ID=$NODE_ID
-  BANDWIDTH_BPS=$BANDWIDTH_BPS
-  LIMIT_MODE=$LIMIT_MODE_STR
-  EOF
+PG_URL=$PG_URL_INPUT
+JOB=$JOB
+INSTANCE=$INSTANCE
+INTERVAL=$INTERVAL
+IFACES="$IFACES"
+RESET_DAY=$RESET_DAY
+LIMIT_BYTES=$LIMIT_BYTES
+NODE_ID=$NODE_ID
+BANDWIDTH_BPS=$BANDWIDTH_BPS
+LIMIT_MODE=$LIMIT_MODE
+EOF
   log "已写入配置 $ENV_FILE"
 
   #------------------------------
   # 写 agent.sh
   #------------------------------
- # 写 agent.sh
-cat >"$AGENT_DIR/agent.sh" <<'EOS'
+  cat >"$AGENT_DIR/agent.sh" <<'EOS'
 #!/usr/bin/env bash
 set -Eeuo pipefail
 source /etc/trafficcop-agent.env
@@ -213,12 +232,12 @@ while true; do
     echo "# TYPE node_id gauge"
   } >"$METRICS_DIR/metrics.prom"
 
-  # 安全处理：如果 IFACES 为空则使用默认值
+  # 安全处理：确保 IFACES 有值
   ACTUAL_IFACES="${IFACES:-eth0}"
   for IF in $ACTUAL_IFACES; do
-    RX=$(cat /sys/class/net/$IF/statistics/rx_bytes 2>/dev/null || echo 0)
-    TX=$(cat /sys/class/net/$IF/statistics/tx_bytes 2>/dev/null || echo 0)
-    STATE=$(cat /sys/class/net/$IF/operstate 2>/dev/null | grep -q up && echo 1 || echo 0)
+    RX=$(cat /sys/class/net/"$IF"/statistics/rx_bytes 2>/dev/null || echo 0)
+    TX=$(cat /sys/class/net/"$IF"/statistics/tx_bytes 2>/dev/null || echo 0)
+    STATE=$(cat /sys/class/net/"$IF"/operstate 2>/dev/null | grep -q up && echo 1 || echo 0)
     echo "traffic_rx_bytes_total{iface=\"$IF\",date=\"$CURRENT_DATE\"} $RX" >>"$METRICS_DIR/metrics.prom"
     echo "traffic_tx_bytes_total{iface=\"$IF\",date=\"$CURRENT_DATE\"} $TX" >>"$METRICS_DIR/metrics.prom"
     echo "traffic_iface_up{iface=\"$IF\"} $STATE" >>"$METRICS_DIR/metrics.prom"
@@ -266,16 +285,32 @@ EOF
   else
      warn "未在 Pushgateway 检测到 $INSTANCE (node_id=$NODE_ID)，可能需要等待一段时间"
   fi
-if [[ -x /opt/trafficcop-agent/tg_notifier.sh ]]; then
+
+  if [[ -x /opt/trafficcop-agent/tg_notifier.sh ]]; then
     /opt/trafficcop-agent/tg_notifier.sh "✅ 面板/监控栈安装或升级完成\n主机: $(hostname) 已安装完成，并注册到面板。"
-fi
+  fi
 
   # 安装完成后回到菜单
   menu
 }
 
 # =============================================================================
-#                       ② 面板栈安装逻辑（面板机用）
+#                       ② 卸载 Agent 函数（新增）
+# =============================================================================
+uninstall_agent() {
+  root
+  log "卸载节点 Agent..."
+  systemctl disable --now trafficcop-agent 2>/dev/null || true
+  rm -f /etc/systemd/system/trafficcop-agent.service
+  rm -f /etc/trafficcop-agent.env /etc/trafficcop-nodeid
+  rm -rf /opt/trafficcop-agent
+  systemctl daemon-reload
+  log "✅ 节点 Agent 已卸载"
+  menu
+}
+
+# =============================================================================
+#                       ③ 面板栈安装逻辑（面板机用）
 # =============================================================================
 REPO_RAW="https://raw.githubusercontent.com/jgwycom/TrafficCop/main"
 INSTALL_DIR="/www/trafficcop-panel"
@@ -301,9 +336,10 @@ install_or_upgrade_stack() {
   else
     warn "未安装 docker；请手动启动面板栈"
   fi
-if [[ -x /opt/trafficcop-agent/tg_notifier.sh ]]; then
+
+  if [[ -x /opt/trafficcop-agent/tg_notifier.sh ]]; then
     /opt/trafficcop-agent/tg_notifier.sh "✅ 面板/监控栈安装或升级完成"
-fi
+  fi
 
   setup_systemd_reset_timer
   log "面板/监控栈安装或升级完成 ✅"
@@ -313,7 +349,7 @@ fi
 }
 
 # =============================================================================
-#                       ③ systemd 双保险 reset
+#                       ④ systemd 双保险 reset
 # =============================================================================
 setup_systemd_reset_timer() {
   root
@@ -354,7 +390,7 @@ EOF
 }
 
 # =============================================================================
-#                       ④ 完全卸载（新增）
+#                       ⑤ 完全卸载（新增）
 # =============================================================================
 uninstall_all() {
   root
@@ -370,7 +406,7 @@ uninstall_all() {
 }
 
 # =============================================================================
-#                                ⑤ 菜单
+#                                ⑥ 菜单
 # =============================================================================
 menu() {
   clear
@@ -413,20 +449,20 @@ menu() {
        log "✅ 已写入 Telegram 配置并安装 tg_notifier.sh"
        menu
        ;;
-7)
-   if [[ ! -f /etc/systemd/system/trafficcop-reset.timer ]]; then
-     warn "未检测到 reset.timer，请先在面板机运行安装/升级面板栈"
-     read -rp "按回车返回菜单..." _
-   else
-     read -rp "请输入新 OnCalendar (默认 00:10:00): " t; t="${t:-00:10:00}"
-     sed -i "s|OnCalendar=.*|OnCalendar=*-*-* $t|" /etc/systemd/system/trafficcop-reset.timer
-     systemctl daemon-reload
-     systemctl restart trafficcop-reset.timer
-     log "✅ 已更新 reset.timer 执行时间"
-     read -rp "按回车返回菜单..." _
-   fi
-   menu
-   ;;
+    7)
+       if [[ ! -f /etc/systemd/system/trafficcop-reset.timer ]]; then
+         warn "未检测到 reset.timer，请先在面板机运行安装/升级面板栈"
+         read -rp "按回车返回菜单..." _
+       else
+         read -rp "请输入新 OnCalendar (默认 00:10:00): " t; t="${t:-00:10:00}"
+         sed -i "s|OnCalendar=.*|OnCalendar=*-*-* $t|" /etc/systemd/system/trafficcop-reset.timer
+         systemctl daemon-reload
+         systemctl restart trafficcop-reset.timer
+         log "✅ 已更新 reset.timer 执行时间"
+         read -rp "按回车返回菜单..." _
+       fi
+       menu
+       ;;
     8) uninstall_all ;;
     9) exit 0 ;;
     *) echo "输入错误"; sleep 1; menu ;;
