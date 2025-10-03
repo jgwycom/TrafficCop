@@ -44,48 +44,50 @@ install_agent() {
   LIMIT_MODE_DEFAULT="double"
 
   #------------------------------
-  # 从现有 ENV 文件读取旧值（优先）
+  # 从现有 ENV 文件读取旧值（优先）- 使用子shell避免污染变量
   #------------------------------
   if [[ -f "$ENV_FILE" ]]; then
     log "检测到现有配置文件 $ENV_FILE，读取旧值..."
-    # 临时取消错误设置以安全source
-    set +u
-    source "$ENV_FILE"
-    set -u
     
-    # 设置默认值为现有值
-    INSTANCE_DEFAULT="${INSTANCE:-}"
-    DISPLAY_NAME_DEFAULT="${DISPLAY_NAME:-${INSTANCE_DEFAULT}}"
-    PG_URL_DEFAULT="${PG_URL:-}"
-    JOB_DEFAULT="${JOB:-trafficcop}"
-    INTERVAL_DEFAULT="${INTERVAL:-10}"
-    RESET_DAY_DEFAULT="${RESET_DAY:-1}"
-    LIMIT_BYTES_GB_DEFAULT=$(awk "BEGIN {printf \"%.0f\", (${LIMIT_BYTES:-0}/1024/1024/1024)}")
-    BANDWIDTH_MBPS_DEFAULT=$(awk "BEGIN {printf \"%.0f\", (${BANDWIDTH_BPS:-0}/1000000)}")
-    LIMIT_MODE_DEFAULT="${LIMIT_MODE:-double}"
-    IFACES_DEFAULT="${IFACES:-eth0}"
+    # 使用子shell读取并导出变量
+    OLD_VALUES=$(set -a; source "$ENV_FILE" 2>/dev/null; set +a; 
+      echo "INSTANCE_DEFAULT=${INSTANCE:-}"
+      echo "DISPLAY_NAME_DEFAULT=${DISPLAY_NAME:-${INSTANCE:-}}"
+      echo "PG_URL_DEFAULT=${PG_URL:-}"
+      echo "JOB_DEFAULT=${JOB:-trafficcop}"
+      echo "INTERVAL_DEFAULT=${INTERVAL:-10}"
+      echo "RESET_DAY_DEFAULT=${RESET_DAY:-1}"
+      echo "LIMIT_BYTES_GB_DEFAULT=$(awk "BEGIN {printf \"%.0f\", (${LIMIT_BYTES:-0}/1024/1024/1024)}")"
+      echo "BANDWIDTH_MBPS_DEFAULT=$(awk "BEGIN {printf \"%.0f\", (${BANDWIDTH_BPS:-0}/1000000)}")"
+      echo "LIMIT_MODE_DEFAULT=${LIMIT_MODE:-double}"
+      echo "IFACES_DEFAULT=${IFACES:-eth0}"
+    )
+    
+    # 评估子shell输出并设置变量
+    eval "$OLD_VALUES"
+    
   else
     # 从旧版配置迁移
     if [[ -f "$OLD_CONF" ]]; then
       log "检测到旧版配置 $OLD_CONF，尝试读取..."
-      set +u
-      source "$OLD_CONF"
-      set -u
-      RESET_DAY_DEFAULT="${RESET_DAY:-1}"
-      LIMIT_BYTES_GB_DEFAULT=$(awk "BEGIN {printf \"%.0f\", (${LIMIT_BYTES:-0}/1024/1024/1024)}")
+      OLD_VALUES=$(set -a; source "$OLD_CONF" 2>/dev/null; set +a;
+        echo "RESET_DAY_DEFAULT=${RESET_DAY:-1}"
+        echo "LIMIT_BYTES_GB_DEFAULT=$(awk "BEGIN {printf \"%.0f\", (${LIMIT_BYTES:-0}/1024/1024/1024)}")"
+      )
+      eval "$OLD_VALUES"
     fi
     
     # 新安装的默认值
-    INSTANCE_DEFAULT=""
-    DISPLAY_NAME_DEFAULT=""
-    PG_URL_DEFAULT=""
-    JOB_DEFAULT="trafficcop"
-    INTERVAL_DEFAULT="10"
+    INSTANCE_DEFAULT="${INSTANCE_DEFAULT:-}"
+    DISPLAY_NAME_DEFAULT="${DISPLAY_NAME_DEFAULT:-}"
+    PG_URL_DEFAULT="${PG_URL_DEFAULT:-}"
+    JOB_DEFAULT="${JOB_DEFAULT:-trafficcop}"
+    INTERVAL_DEFAULT="${INTERVAL_DEFAULT:-10}"
     RESET_DAY_DEFAULT="${RESET_DAY_DEFAULT:-1}"
     LIMIT_BYTES_GB_DEFAULT="${LIMIT_BYTES_GB_DEFAULT:-0}"
-    BANDWIDTH_MBPS_DEFAULT="0"
-    LIMIT_MODE_DEFAULT="double"
-    IFACES_DEFAULT="eth0"
+    BANDWIDTH_MBPS_DEFAULT="${BANDWIDTH_MBPS_DEFAULT:-0}"
+    LIMIT_MODE_DEFAULT="${LIMIT_MODE_DEFAULT:-double}"
+    IFACES_DEFAULT="${IFACES_DEFAULT:-eth0}"
   fi
 
   #------------------------------
@@ -105,6 +107,7 @@ install_agent() {
 
   if [[ -n "${PG_URL_DEFAULT:-}" ]]; then
     PG_URL_INPUT="$PG_URL_DEFAULT"
+    log "使用现有 PG_URL: $PG_URL_INPUT"
   else
     read -rp "Pushgateway 地址 [默认 ${PG_URL_DEFAULT:-}]: " PG_URL_TMP
     PG_URL_INPUT="${PG_URL_TMP:-${PG_URL_DEFAULT:-}}"
@@ -179,6 +182,7 @@ install_agent() {
     echo "$NODE_ID" > "$NODE_ID_FILE"
     log "已分配 NODE_ID=$NODE_ID"
   else
+    log "更新节点信息到面板..."
     curl -s -X PATCH "$PANEL_API/nodes/$NODE_ID" \
       -H "Content-Type: application/json" \
       -d "{\"instance\":\"$INSTANCE\",\"display_name\":\"$DISPLAY_NAME\",\"reset_day\":$RESET_DAY,\"limit_bytes\":$LIMIT_BYTES,\"limit_mode\":\"$LIMIT_MODE\",\"bandwidth_bps\":$BANDWIDTH_BPS}" >/dev/null || true
