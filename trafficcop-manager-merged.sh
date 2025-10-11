@@ -50,7 +50,14 @@ install_agent() {
     log "检测到现有配置文件 $ENV_FILE，读取旧值..."
     
     # 使用子shell读取并导出变量
-    OLD_VALUES=$(set -a; source "$ENV_FILE" 2>/dev/null; set +a; 
+    OLD_VALUES=$(
+      set +u
+      set +e
+      set -a
+      source "$ENV_FILE" 2>/dev/null || true
+      set +a
+      set -e
+      set -u
       echo "INSTANCE_DEFAULT=${INSTANCE:-}"
       echo "DISPLAY_NAME_DEFAULT=${DISPLAY_NAME:-${INSTANCE:-}}"
       echo "PG_URL_DEFAULT=${PG_URL:-}"
@@ -62,10 +69,8 @@ install_agent() {
       echo "LIMIT_MODE_DEFAULT=${LIMIT_MODE:-double}"
       echo "IFACES_DEFAULT=${IFACES:-eth0}"
     )
-    
-    # 评估子shell输出并设置变量
     eval "$OLD_VALUES"
-    
+
   else
     # 从旧版配置迁移
     if [[ -f "$OLD_CONF" ]]; then
@@ -88,6 +93,13 @@ install_agent() {
     BANDWIDTH_MBPS_DEFAULT="${BANDWIDTH_MBPS_DEFAULT:-0}"
     LIMIT_MODE_DEFAULT="${LIMIT_MODE_DEFAULT:-double}"
     IFACES_DEFAULT="${IFACES_DEFAULT:-eth0}"
+
+    # 让环境变量也能作为默认值的兜底（当没有 ENV 文件时）
+    : "${INSTANCE_DEFAULT:=${INSTANCE:-}}"
+    : "${DISPLAY_NAME_DEFAULT:=${DISPLAY_NAME:-${INSTANCE_DEFAULT}}}"
+    : "${PG_URL_DEFAULT:=${PG_URL:-}}"
+    : "${JOB_DEFAULT:=${JOB:-$JOB_DEFAULT}}"
+    : "${INTERVAL_DEFAULT:=${INTERVAL:-$INTERVAL_DEFAULT}}"
   fi
 
   #------------------------------
@@ -475,3 +487,4 @@ menu() {
 
 # 始终进入菜单
 menu
+
