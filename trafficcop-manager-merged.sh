@@ -20,6 +20,8 @@ root() { [[ $EUID -eq 0 ]] || err "请用 root 运行"; }
 #                               ① Agent 安装逻辑
 # =============================================================================
 install_agent() {
+  log "开始执行 install_agent 函数"
+  
   ENV_FILE="/etc/trafficcop-agent.env"
   AGENT_DIR="/opt/trafficcop-agent"
   METRICS_DIR="/run/trafficcop"
@@ -32,7 +34,9 @@ install_agent() {
   #------------------------------
   pg_delete_instance() {
     local pg_url="$1" job="$2" inst="$3"
-    curl -s -X DELETE "${pg_url}/metrics/job/${job}/instance/${inst}" >/dev/null || true
+    if ! curl -s -X DELETE "${pg_url}/metrics/job/${job}/instance/${inst}" >/dev/null; then
+      warn "清理 Pushgateway 残余数据失败: ${pg_url}/metrics/job/${job}/instance/${inst}"
+    fi
   }
 
   #------------------------------
@@ -44,42 +48,43 @@ install_agent() {
   LIMIT_MODE_DEFAULT="double"
 
   #------------------------------
-  # 从现有 ENV 文件读取旧值（优先）- 使用子shell避免污染变量
+  # 从现有 ENV 文件读取旧值 - 修复子shell作用域问题
   #------------------------------
   if [[ -f "$ENV_FILE" ]]; then
     log "检测到现有配置文件 $ENV_FILE，读取旧值..."
     
-    # 使用子shell读取并导出变量
-    OLD_VALUES=$(
-      set +u
-      set +e
-      set -a
-      source "$ENV_FILE" 2>/dev/null || true
-      set +a
-      set -e
-      set -u
-      echo "INSTANCE_DEFAULT=${INSTANCE:-}"
-      echo "DISPLAY_NAME_DEFAULT=${DISPLAY_NAME:-${INSTANCE:-}}"
-      echo "PG_URL_DEFAULT=${PG_URL:-}"
-      echo "JOB_DEFAULT=${JOB:-trafficcop}"
-      echo "INTERVAL_DEFAULT=${INTERVAL:-10}"
-      echo "RESET_DAY_DEFAULT=${RESET_DAY:-1}"
-      echo "LIMIT_BYTES_GB_DEFAULT=$(awk "BEGIN {printf \"%.0f\", (${LIMIT_BYTES:-0}/1024/1024/1024)}")"
-      echo "BANDWIDTH_MBPS_DEFAULT=$(awk "BEGIN {printf \"%.0f\", (${BANDWIDTH_BPS:-0}/1000000)}")"
-      echo "LIMIT_MODE_DEFAULT=${LIMIT_MODE:-double}"
-      echo "IFACES_DEFAULT=${IFACES:-eth0}"
-    )
-    eval "$OLD_VALUES"
+    # 直接在当前进程读取，避免子shell作用域问题
+    set +u
+    set +e
+    if source "$ENV_FILE" 2>/dev/null; then
+      log "成功读取环境文件"
+    else
+      warn "读取环境文件时出错，使用默认值"
+    fi
+    set -e
+    set -u
+    
+    # 设置默认值（确保有值）
+    INSTANCE_DEFAULT="${INSTANCE:-}"
+    DISPLAY_NAME_DEFAULT="${DISPLAY_NAME:-${INSTANCE_DEFAULT}}"
+    PG_URL_DEFAULT="${PG_URL:-}"
+    JOB_DEFAULT="${JOB:-trafficcop}"
+    INTERVAL_DEFAULT="${INTERVAL:-10}"
+    RESET_DAY_DEFAULT="${RESET_DAY:-1}"
+    LIMIT_BYTES_GB_DEFAULT=$(awk "BEGIN {printf \"%.0f\", (${LIMIT_BYTES:-0}/1024/1024/1024)}" 2>/dev/null || echo "0")
+    BANDWIDTH_MBPS_DEFAULT=$(awk "BEGIN {printf \"%.0f\", (${BANDWIDTH_BPS:-0}/1000000)}" 2>/dev/null || echo "0")
+    LIMIT_MODE_DEFAULT="${LIMIT_MODE:-double}"
+    IFACES_DEFAULT="${IFACES:-eth0}"
 
   else
     # 从旧版配置迁移
     if [[ -f "$OLD_CONF" ]]; then
       log "检测到旧版配置 $OLD_CONF，尝试读取..."
-      OLD_VALUES=$(set -a; source "$OLD_CONF" 2>/dev/null; set +a;
-        echo "RESET_DAY_DEFAULT=${RESET_DAY:-1}"
-        echo "LIMIT_BYTES_GB_DEFAULT=$(awk "BEGIN {printf \"%.0f\", (${LIMIT_BYTES:-0}/1024/1024/1024)}")"
-      )
-      eval "$OLD_VALUES"
+      set +u
+      set +e
+      source "$OLD_CONF" 2>/dev/null
+      set -e
+      set -u
     fi
     
     # 新安装的默认值
@@ -101,6 +106,10 @@ install_agent() {
     : "${JOB_DEFAULT:=${JOB:-$JOB_DEFAULT}}"
     : "${INTERVAL_DEFAULT:=${INTERVAL:-$INTERVAL_DEFAULT}}"
   fi
+
+  # 调试信息
+  log "DEBUG: INSTANCE_DEFAULT=$INSTANCE_DEFAULT"
+  log "DEBUG: PG_URL_DEFAULT=$PG_URL_DEFAULT"
 
   #------------------------------
   # 交互输入（显示旧值作为默认）
@@ -185,19 +194,21 @@ install_agent() {
     log "向面板机申请新的 NODE_ID..."
     CREATE_RESP=$(curl -sS -X POST "$PANEL_API/nodes" \
       -H "Content-Type: application/json" \
-      -d "{\"instance\":\"$INSTANCE\",\"display_name\":\"$DISPLAY_NAME\",\"sort_order\":0,\"reset_day\":$RESET_DAY,\"limit_bytes\":$LIMIT_BYTES,\"limit_mode\":\"$LIMIT_MODE\",\"bandwidth_bps\":$BANDWIDTH_BPS}" || true)
+      -d "{\"instance\":\"$INSTANCE\",\"display_name\":\"$DISPLAY_NAME\",\"sort_order\":0,\"reset_day\":$RESET_DAY,\"limit_bytes\":$LIMIT_BYTES,\"limit_mode\":\"$LIMIT_MODE\",\"bandwidth_bps\":$BANDWIDTH_BPS}" || echo "{}")
     NODE_ID=$(printf '%s' "$CREATE_RESP" | tr -d '\n' | grep -o '"id":[[:space:]]*[0-9]\+' | head -n1 | grep -o '[0-9]\+')
     if [[ -z "$NODE_ID" ]]; then
-      log "⚠️ 面板返回无效，临时设置 NODE_ID=0"
+      warn "⚠️ 面板返回无效，临时设置 NODE_ID=0"
       NODE_ID=0
     fi
     echo "$NODE_ID" > "$NODE_ID_FILE"
     log "已分配 NODE_ID=$NODE_ID"
   else
     log "更新节点信息到面板..."
-    curl -s -X PATCH "$PANEL_API/nodes/$NODE_ID" \
+    if ! curl -s -X PATCH "$PANEL_API/nodes/$NODE_ID" \
       -H "Content-Type: application/json" \
-      -d "{\"instance\":\"$INSTANCE\",\"display_name\":\"$DISPLAY_NAME\",\"reset_day\":$RESET_DAY,\"limit_bytes\":$LIMIT_BYTES,\"limit_mode\":\"$LIMIT_MODE\",\"bandwidth_bps\":$BANDWIDTH_BPS}" >/dev/null || true
+      -d "{\"instance\":\"$INSTANCE\",\"display_name\":\"$DISPLAY_NAME\",\"reset_day\":$RESET_DAY,\"limit_bytes\":$LIMIT_BYTES,\"limit_mode\":\"$LIMIT_MODE\",\"bandwidth_bps\":$BANDWIDTH_BPS}" >/dev/null; then
+      warn "更新节点信息到面板失败"
+    fi
   fi
 
   #------------------------------
@@ -205,12 +216,18 @@ install_agent() {
   #------------------------------
   log "清理 Pushgateway 残余 (instance=$INSTANCE)"
   pg_delete_instance "$PG_URL_INPUT" "$JOB" "$INSTANCE"
-  curl -s -X DELETE "$PG_URL_INPUT/metrics/job/$JOB/instance/$INSTANCE/node_id/$NODE_ID" >/dev/null || true
+  if ! curl -s -X DELETE "$PG_URL_INPUT/metrics/job/$JOB/instance/$INSTANCE/node_id/$NODE_ID" >/dev/null; then
+    warn "清理 Pushgateway 节点数据失败"
+  fi
 
   #------------------------------
   # 写配置文件
   #------------------------------
-  install -d -m 755 "$AGENT_DIR" "$METRICS_DIR"
+  log "创建目录和配置文件..."
+  if ! install -d -m 755 "$AGENT_DIR" "$METRICS_DIR"; then
+    err "无法创建目录: $AGENT_DIR 或 $METRICS_DIR"
+  fi
+  
   cat >"$ENV_FILE" <<EOF
 PG_URL=$PG_URL_INPUT
 JOB=$JOB
@@ -223,7 +240,11 @@ NODE_ID=$NODE_ID
 BANDWIDTH_BPS=$BANDWIDTH_BPS
 LIMIT_MODE=$LIMIT_MODE
 EOF
-  log "已写入配置 $ENV_FILE"
+
+  if [[ ! -f "$ENV_FILE" ]]; then
+    err "无法创建配置文件: $ENV_FILE"
+  fi
+  log "✅ 已写入配置 $ENV_FILE"
 
   #------------------------------
   # 写 agent.sh
@@ -267,8 +288,11 @@ while true; do
   sleep "$INTERVAL"
 done
 EOS
-  chmod +x "$AGENT_DIR/agent.sh"
-  log "已写入 $AGENT_DIR/agent.sh"
+
+  if ! chmod +x "$AGENT_DIR/agent.sh"; then
+    err "无法设置 agent.sh 执行权限"
+  fi
+  log "✅ 已写入 $AGENT_DIR/agent.sh"
 
   #------------------------------
   # 写 systemd unit
@@ -288,9 +312,43 @@ EnvironmentFile=$ENV_FILE
 [Install]
 WantedBy=multi-user.target
 EOF
+
+  if [[ ! -f "$SERVICE_FILE" ]]; then
+    err "无法创建 systemd 服务文件: $SERVICE_FILE"
+  fi
+
   systemctl daemon-reload
-  systemctl enable --now trafficcop-agent
-  log "已写入 systemd 单元 $SERVICE_FILE 并启动服务"
+  if ! systemctl enable --now trafficcop-agent; then
+    err "无法启用 trafficcop-agent 服务"
+  fi
+  log "✅ 已写入 systemd 单元 $SERVICE_FILE 并启动服务"
+
+  #------------------------------
+  # 安装验证
+  #------------------------------
+  validate_installation() {
+    log "验证安装结果..."
+    local errors=0
+    
+    [[ -f "$ENV_FILE" ]] || { warn "缺少: $ENV_FILE"; ((errors++)); }
+    [[ -f "$AGENT_DIR/agent.sh" ]] || { warn "缺少: $AGENT_DIR/agent.sh"; ((errors++)); }
+    [[ -f "$SERVICE_FILE" ]] || { warn "缺少: $SERVICE_FILE"; ((errors++)); }
+    
+    if systemctl is-active trafficcop-agent &>/dev/null; then
+      log "✅ 服务正在运行"
+    else
+      warn "服务未运行"
+      ((errors++))
+    fi
+    
+    if [[ $errors -eq 0 ]]; then
+      log "✅ 所有组件安装成功"
+    else
+      warn "⚠️ 安装完成但有 $errors 个问题，请检查"
+    fi
+  }
+
+  validate_installation
 
   #------------------------------
   # 自检
@@ -306,8 +364,8 @@ EOF
     /opt/trafficcop-agent/tg_notifier.sh "✅ 面板/监控栈安装或升级完成\n主机: $(hostname) 已安装完成，并注册到面板。"
   fi
 
-  # 安装完成后回到菜单
-  menu
+  log "✅ Agent 安装完成"
+  read -rp "按回车返回菜单..." _
 }
 
 # =============================================================================
@@ -322,7 +380,7 @@ uninstall_agent() {
   rm -rf /opt/trafficcop-agent
   systemctl daemon-reload
   log "✅ 节点 Agent 已卸载"
-  menu
+  read -rp "按回车返回菜单..." _
 }
 
 # =============================================================================
@@ -340,14 +398,23 @@ install_or_upgrade_stack() {
   mkdir -p "$INSTALL_DIR" "$DB_DIR"
 
   log "从仓库获取最新面板与编排文件..."
-  curl -fsSL "$REPO_RAW/docker-compose.yml" -o "$INSTALL_DIR/docker-compose.yml"
-  curl -fsSL "$REPO_RAW/app.py" -o "$INSTALL_DIR/app.py"
-  curl -fsSL "$REPO_RAW/trafficcop.json" -o "$INSTALL_DIR/trafficcop.json"
+  if ! curl -fsSL "$REPO_RAW/docker-compose.yml" -o "$INSTALL_DIR/docker-compose.yml"; then
+    err "下载 docker-compose.yml 失败"
+  fi
+  if ! curl -fsSL "$REPO_RAW/app.py" -o "$INSTALL_DIR/app.py"; then
+    err "下载 app.py 失败"
+  fi
+  if ! curl -fsSL "$REPO_RAW/trafficcop.json" -o "$INSTALL_DIR/trafficcop.json"; then
+    err "下载 trafficcop.json 失败"
+  fi
   if ! [[ -f "$ENV_PATH" ]]; then
-    curl -fsSL "$REPO_RAW/settings.env" -o "$ENV_PATH"
+    if ! curl -fsSL "$REPO_RAW/settings.env" -o "$ENV_PATH"; then
+      err "下载 settings.env 失败"
+    fi
   fi
 
   if command -v docker >/dev/null 2>&1; then
+    log "启动 Docker 容器..."
     (cd "$INSTALL_DIR" && docker compose up -d || docker-compose up -d)
   else
     warn "未安装 docker；请手动启动面板栈"
@@ -359,9 +426,7 @@ install_or_upgrade_stack() {
 
   setup_systemd_reset_timer
   log "面板/监控栈安装或升级完成 ✅"
-
-  # 安装完成后回到菜单
-  menu
+  read -rp "按回车返回菜单..." _
 }
 
 # =============================================================================
@@ -418,73 +483,96 @@ uninstall_all() {
   systemctl daemon-reload
   rm -rf /opt/trafficcop-agent /etc/trafficcop-agent.env /etc/trafficcop-nodeid /etc/trafficcop /www/trafficcop-panel
   log "✅ 已完成完全卸载（Agent + 面板栈 + 数据目录已清理）"
-  menu
+  read -rp "按回车返回菜单..." _
 }
 
 # =============================================================================
 #                                ⑥ 菜单
 # =============================================================================
 menu() {
-  clear
-  echo -e "\e[36m============ TrafficCop 管理面板 V4 ============\e[0m"
-  echo "1. 安装/升级 节点 Agent（节点机用）"
-  echo "2. 卸载 节点 Agent（节点机用）"
-  echo "3. 安装/升级 面板栈（面板机用）"
-  echo "4. 卸载 面板/监控栈（不删数据）"
-  echo "5. 查看状态"
-  echo "6. 配置 Telegram 推送"
-  echo "7. 调整每日任务时间"
-  echo "8. ⚠️ 完全卸载（Agent + 面板栈 + 数据目录）"
-  echo "9. 退出"
-  echo "============================================"
-  read -rp "请输入选项: " num
-  case "$num" in
-    1) install_agent ;;
-    2) uninstall_agent ;;
-    3) install_or_upgrade_stack ;;
-    4) systemctl disable --now trafficcop-reset.timer; menu ;;
-    5)
-       systemctl status trafficcop-agent --no-pager || true
-       if systemctl list-unit-files | grep -q trafficcop-reset.timer; then
-         systemctl status trafficcop-reset.timer --no-pager || true
-       else
-         echo "节点机未启用 reset.timer"
-       fi
-       read -rp "按回车返回菜单..." _
-       menu
-       ;;
-    6)
-       root
-       mkdir -p /etc/trafficcop
-       read -rp "TG_BOT_TOKEN: " t
-       read -rp "TG_CHAT_ID: " c
-       echo "TG_BOT_TOKEN=$t" >/etc/trafficcop/telegram.env
-       echo "TG_CHAT_ID=$c" >>/etc/trafficcop/telegram.env
-       curl -fsSL "$REPO_RAW/tg_notifier.sh" -o /opt/trafficcop-agent/tg_notifier.sh
-       chmod +x /opt/trafficcop-agent/tg_notifier.sh
-       log "✅ 已写入 Telegram 配置并安装 tg_notifier.sh"
-       menu
-       ;;
-    7)
-       if [[ ! -f /etc/systemd/system/trafficcop-reset.timer ]]; then
-         warn "未检测到 reset.timer，请先在面板机运行安装/升级面板栈"
-         read -rp "按回车返回菜单..." _
-       else
-         read -rp "请输入新 OnCalendar (默认 00:10:00): " t; t="${t:-00:10:00}"
-         sed -i "s|OnCalendar=.*|OnCalendar=*-*-* $t|" /etc/systemd/system/trafficcop-reset.timer
-         systemctl daemon-reload
-         systemctl restart trafficcop-reset.timer
-         log "✅ 已更新 reset.timer 执行时间"
-         read -rp "按回车返回菜单..." _
-       fi
-       menu
-       ;;
-    8) uninstall_all ;;
-    9) exit 0 ;;
-    *) echo "输入错误"; sleep 1; menu ;;
-  esac
+  while true; do
+    clear
+    echo -e "\e[36m============ TrafficCop 管理面板 V4 ============\e[0m"
+    echo "1. 安装/升级 节点 Agent（节点机用）"
+    echo "2. 卸载 节点 Agent（节点机用）"
+    echo "3. 安装/升级 面板栈（面板机用）"
+    echo "4. 卸载 面板/监控栈（不删数据）"
+    echo "5. 查看状态"
+    echo "6. 配置 Telegram 推送"
+    echo "7. 调整每日任务时间"
+    echo "8. ⚠️ 完全卸载（Agent + 面板栈 + 数据目录）"
+    echo "9. 退出"
+    echo "============================================"
+    read -rp "请输入选项: " num
+    case "$num" in
+      1) 
+        install_agent
+        ;;
+      2) 
+        uninstall_agent
+        ;;
+      3) 
+        install_or_upgrade_stack
+        ;;
+      4) 
+        systemctl disable --now trafficcop-reset.timer
+        read -rp "按回车返回菜单..." _
+        ;;
+      5)
+        echo "=== 服务状态 ==="
+        systemctl status trafficcop-agent --no-pager 2>/dev/null || echo "❌ trafficcop-agent 服务未安装或未运行"
+        if systemctl list-unit-files | grep -q trafficcop-reset.timer; then
+          systemctl status trafficcop-reset.timer --no-pager || echo "❌ trafficcop-reset.timer 状态异常"
+        else
+          echo "ℹ️  节点机未启用 reset.timer"
+        fi
+        echo -e "\n=== 文件检查 ==="
+        [[ -f "/etc/trafficcop-agent.env" ]] && echo "✅ /etc/trafficcop-agent.env 存在" || echo "❌ /etc/trafficcop-agent.env 不存在"
+        [[ -f "/opt/trafficcop-agent/agent.sh" ]] && echo "✅ /opt/trafficcop-agent/agent.sh 存在" || echo "❌ /opt/trafficcop-agent/agent.sh 不存在"
+        [[ -f "/etc/systemd/system/trafficcop-agent.service" ]] && echo "✅ /etc/systemd/system/trafficcop-agent.service 存在" || echo "❌ /etc/systemd/system/trafficcop-agent.service 不存在"
+        read -rp "按回车返回菜单..." _
+        ;;
+      6)
+        root
+        mkdir -p /etc/trafficcop
+        read -rp "TG_BOT_TOKEN: " t
+        read -rp "TG_CHAT_ID: " c
+        echo "TG_BOT_TOKEN=$t" >/etc/trafficcop/telegram.env
+        echo "TG_CHAT_ID=$c" >>/etc/trafficcop/telegram.env
+        if curl -fsSL "$REPO_RAW/tg_notifier.sh" -o /opt/trafficcop-agent/tg_notifier.sh; then
+          chmod +x /opt/trafficcop-agent/tg_notifier.sh
+          log "✅ 已写入 Telegram 配置并安装 tg_notifier.sh"
+        else
+          warn "下载 tg_notifier.sh 失败"
+        fi
+        read -rp "按回车返回菜单..." _
+        ;;
+      7)
+        if [[ ! -f /etc/systemd/system/trafficcop-reset.timer ]]; then
+          warn "未检测到 reset.timer，请先在面板机运行安装/升级面板栈"
+          read -rp "按回车返回菜单..." _
+        else
+          read -rp "请输入新 OnCalendar (默认 00:10:00): " t; t="${t:-00:10:00}"
+          sed -i "s|OnCalendar=.*|OnCalendar=*-*-* $t|" /etc/systemd/system/trafficcop-reset.timer
+          systemctl daemon-reload
+          systemctl restart trafficcop-reset.timer
+          log "✅ 已更新 reset.timer 执行时间"
+          read -rp "按回车返回菜单..." _
+        fi
+        ;;
+      8) 
+        uninstall_all
+        ;;
+      9) 
+        exit 0 
+        ;;
+      *) 
+        echo "输入错误"
+        sleep 1
+        ;;
+    esac
+  done
 }
 
 # 始终进入菜单
 menu
-
