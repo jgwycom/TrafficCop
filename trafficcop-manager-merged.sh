@@ -12,6 +12,29 @@ install_agent() {
   NODE_ID_FILE="/etc/trafficcop-nodeid"
 
   #------------------------------
+  # 🆕 获取本机公网 IP (新增)
+  #------------------------------
+  get_public_ip() {
+    local ip=""
+    for service in "ifconfig.me" "ipinfo.io/ip" "api.ipify.org"; do
+      ip=$(curl -s --connect-timeout 5 "$service" 2>/dev/null | tr -d '\n\r ')
+      if [[ -n "$ip" && "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+        echo "$ip"
+        return 0
+      fi
+    done
+    echo ""
+  }
+  
+  log "正在探测本机公网 IP..."
+  PUBLIC_IP=$(get_public_ip)
+  if [[ -n "$PUBLIC_IP" ]]; then
+    log "✅ 检测到本机 IP: $PUBLIC_IP"
+  else
+    warn "⚠️ 无法获取公网 IP，将由面板自动判断来源"
+  fi
+
+  #------------------------------
   # 清理函数
   #------------------------------
   pg_delete_instance() {
@@ -152,7 +175,7 @@ install_agent() {
   log "自动推导 PANEL_API=$PANEL_API"
 
   #------------------------------
-  # 🆕 第二步：优先从面板机查询该 IP 是否已注册
+  # 🆕 第二步：优先从面板机查询该 IP 是否已注册 (V5自动同步版)
   #------------------------------
   echo ""
   echo "=============================="
@@ -160,46 +183,43 @@ install_agent() {
   echo "=============================="
   
   if query_node_by_ip "$PANEL_API" "$MY_PUBLIC_IP"; then
-    # 面板机已有该 IP 的记录，使用面板机的数据作为默认值
+    # === 情况A：面板机数据库中找到了这个 IP ===
+    # 策略：完全信任面板机数据，覆盖本地设置
     INSTANCE_DEFAULT="${PANEL_INSTANCE}"
     DISPLAY_NAME_DEFAULT="${PANEL_DISPLAY_NAME}"
     NODE_ID="$PANEL_NODE_ID"
     
     echo ""
-    echo -e "\e[33m⚠️ 检测到该 IP 已在面板机注册过！\e[0m"
-    echo "   原 NODE_ID: $NODE_ID"
-    echo "   原 INSTANCE: $INSTANCE_DEFAULT"
-    echo "   原 DISPLAY_NAME: $DISPLAY_NAME_DEFAULT"
-    echo ""
-    read -rp "是否使用面板机的现有配置？(y=使用并可修改 / n=作为全新节点): " use_panel
+    log "✅ 自动识别：该 IP 已在面板注册 (ID=$NODE_ID)"
+    log "ℹ️  将自动加载面板端的配置信息（优先于本地）"
+    echo "   实例名称: $INSTANCE_DEFAULT"
+    echo "   显示名称: $DISPLAY_NAME_DEFAULT"
     
-    if [[ "$use_panel" =~ ^[Nn]$ ]]; then
-      log "用户选择作为全新节点注册..."
-      NODE_ID=""
+  else
+    # === 情况B：面板机数据库没找到这个 IP ===
+    # 策略：面板是权威的。如果面板没记录，说明是新机器，或者面板数据已重置。
+    # 此时必须忽略本地旧 ID，防止向错误的 ID 推送数据。
+    
+    if [[ -f "$NODE_ID_FILE" ]]; then
+      local_id=$(cat "$NODE_ID_FILE")
+      warn "⚠️  本地存在旧 ID=$local_id，但面板数据库无此 IP 记录。"
+      warn "⚠️  根据'优先读取面板数据库'原则，将忽略本地旧 ID，视为新节点。"
+      rm -f "$NODE_ID_FILE"
+    fi
+    
+    log "ℹ️  面板未收录此 IP，将作为新节点进行安装..."
+    NODE_ID=""
+    
+    # 尝试从本地 ENV 读取默认名称（仅作为输入提示，不作为身份依据）
+    if [[ -f "$ENV_FILE" ]]; then
+      set +u; set +e; source "$ENV_FILE" 2>/dev/null; set -e; set -u
+      INSTANCE_DEFAULT="${INSTANCE:-}"
+      DISPLAY_NAME_DEFAULT="${DISPLAY_NAME:-${INSTANCE_DEFAULT}}"
+    else
       INSTANCE_DEFAULT=""
       DISPLAY_NAME_DEFAULT=""
-    else
-      log "将更新现有节点 ID=$NODE_ID 的信息..."
     fi
-  else
-    # 面板机没有该 IP 的记录
-    # 检查本地是否有旧的 NODE_ID 文件（可能是克隆机器）
-    if [[ -f "$NODE_ID_FILE" ]]; then
-      local_node_id=$(cat "$NODE_ID_FILE")
-      warn "⚠️ 本地存在 NODE_ID=$local_node_id，但面板机未找到该 IP 的记录"
-      warn "   这可能是因为：1) 机器从其他节点克隆而来  2) 面板机数据库已重置"
-      read -rp "是否忽略本地 NODE_ID 并作为新节点注册？(y=新注册 / n=尝试复用): " ignore_local
-      
-      if [[ "$ignore_local" =~ ^[Yy]$ ]]; then
-        rm -f "$NODE_ID_FILE"
-        log "已删除本地 NODE_ID 文件，将作为新节点注册"
-        NODE_ID=""
-      else
-        NODE_ID="$local_node_id"
-      fi
-    else
-      NODE_ID=""
-    fi
+  fi
     
     # 从本地 ENV 文件读取默认值（如果有）
     if [[ -f "$ENV_FILE" ]]; then
