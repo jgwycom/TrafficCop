@@ -160,7 +160,7 @@ install_agent() {
   fi
 
   PANEL_HOST=$(echo "$PG_URL_INPUT" | sed -E 's#^https?://([^:/]+).*#\1#')
-  PANEL_API="http://${PANEL_HOST}:18000"
+  PANEL_API="http://${PANEL_HOST}:18000/admin"
   log "自动推导 PANEL_API=$PANEL_API"
 
   #------------------------------
