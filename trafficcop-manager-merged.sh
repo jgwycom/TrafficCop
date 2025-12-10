@@ -1,5 +1,24 @@
+#!/usr/bin/env bash
+# V5 - IP优先版
+# trafficcop-manager-merged.sh
+# =============== 节点/面板分离版 ===============
+# - 节点机：安装/升级/卸载 Agent
+# - 面板机：安装/升级/卸载 面板栈 (docker-compose)
+# - 新增：完全卸载（Agent + 面板栈 + 数据目录）
+# - V5新增：IP优先识别，优先读取面板数据库
+# ===============================================
+
+set -Eeuo pipefail
+
+# -------- 通用工具 --------
+log()  { echo -e "\e[32m[$(date '+%F %T')] $*\e[0m"; }
+warn() { echo -e "\e[33m[$(date '+%F %T')] $*\e[0m"; }
+err()  { echo -e "\e[31m[$(date '+%F %T')] $*\e[0m"; exit 1; }
+need() { command -v "$1" >/dev/null 2>&1 || err "缺少依赖：$1"; }
+root() { [[ $EUID -eq 0 ]] || err "请用 root 运行"; }
+
 # =============================================================================
-#                               ① Agent 安装逻辑 (V5 - IP优先版)
+#                    ① Agent 安装逻辑 (V5 - IP优先版)
 # =============================================================================
 install_agent() {
   log "开始执行 install_agent 函数 (V5 - IP优先版)"
@@ -10,29 +29,6 @@ install_agent() {
   SERVICE_FILE="/etc/systemd/system/trafficcop-agent.service"
   OLD_CONF="/root/TrafficCop/traffic_monitor_config.txt"
   NODE_ID_FILE="/etc/trafficcop-nodeid"
-
-  #------------------------------
-  # 🆕 获取本机公网 IP (新增)
-  #------------------------------
-  get_public_ip() {
-    local ip=""
-    for service in "ifconfig.me" "ipinfo.io/ip" "api.ipify.org"; do
-      ip=$(curl -s --connect-timeout 5 "$service" 2>/dev/null | tr -d '\n\r ')
-      if [[ -n "$ip" && "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-        echo "$ip"
-        return 0
-      fi
-    done
-    echo ""
-  }
-  
-  log "正在探测本机公网 IP..."
-  PUBLIC_IP=$(get_public_ip)
-  if [[ -n "$PUBLIC_IP" ]]; then
-    log "✅ 检测到本机 IP: $PUBLIC_IP"
-  else
-    warn "⚠️ 无法获取公网 IP，将由面板自动判断来源"
-  fi
 
   #------------------------------
   # 清理函数
@@ -49,7 +45,6 @@ install_agent() {
   #------------------------------
   get_public_ip() {
     local ip=""
-    # 尝试多个公网 IP 查询服务
     for service in "ifconfig.me" "ipinfo.io/ip" "icanhazip.com" "api.ipify.org"; do
       ip=$(curl -s --connect-timeout 5 "$service" 2>/dev/null | tr -d '\n\r ')
       if [[ -n "$ip" && "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
@@ -57,7 +52,6 @@ install_agent() {
         return 0
       fi
     done
-    # 回退到本地 IP
     ip=$(hostname -I 2>/dev/null | awk '{print $1}')
     echo "$ip"
   }
@@ -71,11 +65,9 @@ install_agent() {
     
     log "正在从面板机查询 IP=$my_ip 是否已注册..."
     
-    # 调用面板机的 API 查询
     local resp
     resp=$(curl -sS --connect-timeout 10 "${panel_api}/nodes/query-by-ip?ip=${my_ip}" 2>/dev/null || echo "{}")
     
-    # 解析返回的 JSON
     local found_id found_instance found_display_name
     found_id=$(echo "$resp" | grep -o '"id":[[:space:]]*[0-9]\+' | head -n1 | grep -o '[0-9]\+' || echo "")
     found_instance=$(echo "$resp" | grep -o '"instance":[[:space:]]*"[^"]*"' | head -n1 | sed 's/"instance":[[:space:]]*"\([^"]*\)"/\1/' || echo "")
@@ -87,7 +79,6 @@ install_agent() {
       log "   INSTANCE=$found_instance"
       log "   DISPLAY_NAME=$found_display_name"
       
-      # 导出变量供后续使用
       PANEL_NODE_ID="$found_id"
       PANEL_INSTANCE="$found_instance"
       PANEL_DISPLAY_NAME="$found_display_name"
@@ -109,7 +100,6 @@ install_agent() {
   BANDWIDTH_MBPS_DEFAULT="0"
   LIMIT_MODE_DEFAULT="double"
   
-  # 初始化面板查询结果变量
   PANEL_NODE_ID=""
   PANEL_INSTANCE=""
   PANEL_DISPLAY_NAME=""
@@ -169,7 +159,6 @@ install_agent() {
     [[ -z "$PG_URL_INPUT" ]] && { echo "❌ PG_URL 不能为空"; exit 1; }
   fi
 
-  # 自动推导 PANEL_API
   PANEL_HOST=$(echo "$PG_URL_INPUT" | sed -E 's#^https?://([^:/]+).*#\1#')
   PANEL_API="http://${PANEL_HOST}:18000"
   log "自动推导 PANEL_API=$PANEL_API"
@@ -183,8 +172,6 @@ install_agent() {
   echo "=============================="
   
   if query_node_by_ip "$PANEL_API" "$MY_PUBLIC_IP"; then
-    # === 情况A：面板机数据库中找到了这个 IP ===
-    # 策略：完全信任面板机数据，覆盖本地设置
     INSTANCE_DEFAULT="${PANEL_INSTANCE}"
     DISPLAY_NAME_DEFAULT="${PANEL_DISPLAY_NAME}"
     NODE_ID="$PANEL_NODE_ID"
@@ -194,12 +181,7 @@ install_agent() {
     log "ℹ️  将自动加载面板端的配置信息（优先于本地）"
     echo "   实例名称: $INSTANCE_DEFAULT"
     echo "   显示名称: $DISPLAY_NAME_DEFAULT"
-    
   else
-    # === 情况B：面板机数据库没找到这个 IP ===
-    # 策略：面板是权威的。如果面板没记录，说明是新机器，或者面板数据已重置。
-    # 此时必须忽略本地旧 ID，防止向错误的 ID 推送数据。
-    
     if [[ -f "$NODE_ID_FILE" ]]; then
       local_id=$(cat "$NODE_ID_FILE")
       warn "⚠️  本地存在旧 ID=$local_id，但面板数据库无此 IP 记录。"
@@ -210,7 +192,6 @@ install_agent() {
     log "ℹ️  面板未收录此 IP，将作为新节点进行安装..."
     NODE_ID=""
     
-    # 尝试从本地 ENV 读取默认名称（仅作为输入提示，不作为身份依据）
     if [[ -f "$ENV_FILE" ]]; then
       set +u; set +e; source "$ENV_FILE" 2>/dev/null; set -e; set -u
       INSTANCE_DEFAULT="${INSTANCE:-}"
@@ -220,7 +201,7 @@ install_agent() {
       DISPLAY_NAME_DEFAULT=""
     fi
   fi
-    
+
   #------------------------------
   # 其他默认值（从本地 ENV 或使用系统默认）
   #------------------------------
@@ -276,7 +257,6 @@ install_agent() {
   read -rp "请选择限流模式 [默认 $LIMIT_MODE_DEFAULT]: " LIMIT_MODE_INPUT
   LIMIT_MODE="${LIMIT_MODE_INPUT:-$LIMIT_MODE_DEFAULT}"
 
-  # 网卡选择
   AVAILABLE_IFACES=$(ls /sys/class/net | grep -Ev '^(lo|docker.*|veth.*)$')
   DEFAULT_IFACE="${IFACES_DEFAULT:-$(echo "$AVAILABLE_IFACES" | grep -qw "eth0" && echo "eth0" || echo "$(echo "$AVAILABLE_IFACES" | head -n1)")}"
   
@@ -298,7 +278,6 @@ install_agent() {
   log "   INSTANCE: $INSTANCE"
   log "   DISPLAY_NAME: $DISPLAY_NAME"
   
-  # 构建 JSON 请求体（包含 IP）
   JSON_BODY=$(cat <<EOF
 {
   "instance": "$INSTANCE",
@@ -314,26 +293,22 @@ EOF
 )
 
   if [[ -n "${NODE_ID:-}" && "$NODE_ID" != "0" ]]; then
-    # 更新现有节点
     log "更新现有节点 ID=$NODE_ID..."
     UPDATE_RESP=$(curl -sS -X PATCH "${PANEL_API}/nodes/${NODE_ID}" \
       -H "Content-Type: application/json" \
       -d "$JSON_BODY" 2>/dev/null || echo "{}")
     
-    # 检查更新是否成功
     if echo "$UPDATE_RESP" | grep -q '"id"'; then
       log "✅ 节点更新成功"
     else
       warn "⚠️ 节点更新可能失败: $UPDATE_RESP"
     fi
   else
-    # 创建新节点
     log "创建新节点..."
     CREATE_RESP=$(curl -sS -X POST "${PANEL_API}/nodes" \
       -H "Content-Type: application/json" \
       -d "$JSON_BODY" 2>/dev/null || echo "{}")
     
-    # 解析返回的 NODE_ID
     NODE_ID=$(echo "$CREATE_RESP" | grep -o '"id":[[:space:]]*[0-9]\+' | head -n1 | grep -o '[0-9]\+' || echo "")
     
     if [[ -z "$NODE_ID" || "$NODE_ID" == "0" ]]; then
@@ -345,7 +320,6 @@ EOF
     fi
   fi
 
-  # 保存 NODE_ID 到本地
   echo "$NODE_ID" > "$NODE_ID_FILE"
   log "已保存 NODE_ID=$NODE_ID 到 $NODE_ID_FILE"
 
@@ -474,6 +448,10 @@ EOF
      warn "未在 Pushgateway 检测到，可能需要等待一段时间"
   fi
 
+  if [[ -x /opt/trafficcop-agent/tg_notifier.sh ]]; then
+    /opt/trafficcop-agent/tg_notifier.sh "✅ 面板/监控栈安装或升级完成\n主机: $(hostname) 已安装完成，并注册到面板。"
+  fi
+
   echo ""
   echo "=============================="
   echo -e "\e[32m✅ Agent 安装完成\e[0m"
@@ -485,3 +463,213 @@ EOF
   
   read -rp "按回车返回菜单..." _
 }
+
+# =============================================================================
+#                       ② 卸载 Agent 函数
+# =============================================================================
+uninstall_agent() {
+  root
+  log "卸载节点 Agent..."
+  systemctl disable --now trafficcop-agent 2>/dev/null || true
+  rm -f /etc/systemd/system/trafficcop-agent.service
+  rm -f /etc/trafficcop-agent.env /etc/trafficcop-nodeid
+  rm -rf /opt/trafficcop-agent
+  systemctl daemon-reload
+  log "✅ 节点 Agent 已卸载"
+  read -rp "按回车返回菜单..." _
+}
+
+# =============================================================================
+#                       ③ 面板栈安装逻辑（面板机用）
+# =============================================================================
+REPO_RAW="https://raw.githubusercontent.com/jgwycom/TrafficCop/main"
+INSTALL_DIR="/www/trafficcop-panel"
+DB_DIR="$INSTALL_DIR/data"
+DB_PATH="$DB_DIR/trafficcop.db"
+ENV_PATH="$INSTALL_DIR/settings.env"
+
+install_or_upgrade_stack() {
+  root
+  need curl
+  mkdir -p "$INSTALL_DIR" "$DB_DIR"
+
+  log "从仓库获取最新面板与编排文件..."
+  if ! curl -fsSL "$REPO_RAW/docker-compose.yml" -o "$INSTALL_DIR/docker-compose.yml"; then
+    err "下载 docker-compose.yml 失败"
+  fi
+  if ! curl -fsSL "$REPO_RAW/app.py" -o "$INSTALL_DIR/app.py"; then
+    err "下载 app.py 失败"
+  fi
+  if ! curl -fsSL "$REPO_RAW/trafficcop.json" -o "$INSTALL_DIR/trafficcop.json"; then
+    err "下载 trafficcop.json 失败"
+  fi
+  if ! [[ -f "$ENV_PATH" ]]; then
+    if ! curl -fsSL "$REPO_RAW/settings.env" -o "$ENV_PATH"; then
+      err "下载 settings.env 失败"
+    fi
+  fi
+
+  if command -v docker >/dev/null 2>&1; then
+    log "启动 Docker 容器..."
+    (cd "$INSTALL_DIR" && docker compose up -d || docker-compose up -d)
+  else
+    warn "未安装 docker；请手动启动面板栈"
+  fi
+
+  if [[ -x /opt/trafficcop-agent/tg_notifier.sh ]]; then
+    /opt/trafficcop-agent/tg_notifier.sh "✅ 面板/监控栈安装或升级完成"
+  fi
+
+  setup_systemd_reset_timer
+  log "面板/监控栈安装或升级完成 ✅"
+  read -rp "按回车返回菜单..." _
+}
+
+# =============================================================================
+#                       ④ systemd 双保险 reset
+# =============================================================================
+setup_systemd_reset_timer() {
+  root
+  need python3
+  cat >/usr/local/bin/trafficcop-reset.sh <<"EOF"
+#!/usr/bin/env bash
+set -e
+curl -fsSL http://127.0.0.1:8000/admin/reset-baseline >/dev/null 2>&1 || true
+EOF
+  chmod +x /usr/local/bin/trafficcop-reset.sh
+
+  cat >/etc/systemd/system/trafficcop-reset.service <<EOF
+[Unit]
+Description=TrafficCop 月度流量基线重置
+After=network.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/trafficcop-reset.sh
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+  cat >/etc/systemd/system/trafficcop-reset.timer <<EOF
+[Unit]
+Description=每日 00:10 执行流量基线重置
+[Timer]
+OnCalendar=*-*-* 00:10:00
+Persistent=true
+[Install]
+WantedBy=timers.target
+EOF
+
+  systemctl daemon-reload
+  systemctl enable --now trafficcop-reset.timer
+  log "systemd reset 定时任务已启用（每日 00:10）"
+}
+
+# =============================================================================
+#                       ⑤ 完全卸载
+# =============================================================================
+uninstall_all() {
+  root
+  log "⚠️ 将卸载 Agent + 面板栈 + 数据目录..."
+  systemctl disable --now trafficcop-agent 2>/dev/null || true
+  systemctl disable --now trafficcop-reset.timer 2>/dev/null || true
+  rm -f /etc/systemd/system/trafficcop-agent.service
+  rm -f /etc/systemd/system/trafficcop-reset.{service,timer}
+  systemctl daemon-reload
+  rm -rf /opt/trafficcop-agent /etc/trafficcop-agent.env /etc/trafficcop-nodeid /etc/trafficcop /www/trafficcop-panel
+  log "✅ 已完成完全卸载（Agent + 面板栈 + 数据目录已清理）"
+  read -rp "按回车返回菜单..." _
+}
+
+# =============================================================================
+#                                ⑥ 菜单
+# =============================================================================
+menu() {
+  while true; do
+    clear
+    echo -e "\e[36m============ TrafficCop 管理面板 V5 ============\e[0m"
+    echo "1. 安装/升级 节点 Agent（节点机用）"
+    echo "2. 卸载 节点 Agent（节点机用）"
+    echo "3. 安装/升级 面板栈（面板机用）"
+    echo "4. 卸载 面板/监控栈（不删数据）"
+    echo "5. 查看状态"
+    echo "6. 配置 Telegram 推送"
+    echo "7. 调整每日任务时间"
+    echo "8. ⚠️ 完全卸载（Agent + 面板栈 + 数据目录）"
+    echo "9. 退出"
+    echo "============================================"
+    read -rp "请输入选项: " num
+    case "$num" in
+      1) 
+        install_agent
+        ;;
+      2) 
+        uninstall_agent
+        ;;
+      3) 
+        install_or_upgrade_stack
+        ;;
+      4) 
+        systemctl disable --now trafficcop-reset.timer 2>/dev/null || true
+        read -rp "按回车返回菜单..." _
+        ;;
+      5)
+        echo "=== 服务状态 ==="
+        systemctl status trafficcop-agent --no-pager 2>/dev/null || echo "❌ trafficcop-agent 服务未安装或未运行"
+        if systemctl list-unit-files | grep -q trafficcop-reset.timer; then
+          systemctl status trafficcop-reset.timer --no-pager || echo "❌ trafficcop-reset.timer 状态异常"
+        else
+          echo "ℹ️  节点机未启用 reset.timer"
+        fi
+        echo -e "\n=== 文件检查 ==="
+        [[ -f "/etc/trafficcop-agent.env" ]] && echo "✅ /etc/trafficcop-agent.env 存在" || echo "❌ /etc/trafficcop-agent.env 不存在"
+        [[ -f "/opt/trafficcop-agent/agent.sh" ]] && echo "✅ /opt/trafficcop-agent/agent.sh 存在" || echo "❌ /opt/trafficcop-agent/agent.sh 不存在"
+        [[ -f "/etc/systemd/system/trafficcop-agent.service" ]] && echo "✅ /etc/systemd/system/trafficcop-agent.service 存在" || echo "❌ /etc/systemd/system/trafficcop-agent.service 不存在"
+        read -rp "按回车返回菜单..." _
+        ;;
+      6)
+        root
+        mkdir -p /etc/trafficcop
+        read -rp "TG_BOT_TOKEN: " t
+        read -rp "TG_CHAT_ID: " c
+        echo "TG_BOT_TOKEN=$t" >/etc/trafficcop/telegram.env
+        echo "TG_CHAT_ID=$c" >>/etc/trafficcop/telegram.env
+        if curl -fsSL "$REPO_RAW/tg_notifier.sh" -o /opt/trafficcop-agent/tg_notifier.sh; then
+          chmod +x /opt/trafficcop-agent/tg_notifier.sh
+          log "✅ 已写入 Telegram 配置并安装 tg_notifier.sh"
+        else
+          warn "下载 tg_notifier.sh 失败"
+        fi
+        read -rp "按回车返回菜单..." _
+        ;;
+      7)
+        if [[ ! -f /etc/systemd/system/trafficcop-reset.timer ]]; then
+          warn "未检测到 reset.timer，请先在面板机运行安装/升级面板栈"
+          read -rp "按回车返回菜单..." _
+        else
+          read -rp "请输入新 OnCalendar (默认 00:10:00): " t; t="${t:-00:10:00}"
+          sed -i "s|OnCalendar=.*|OnCalendar=*-*-* $t|" /etc/systemd/system/trafficcop-reset.timer
+          systemctl daemon-reload
+          systemctl restart trafficcop-reset.timer
+          log "✅ 已更新 reset.timer 执行时间"
+          read -rp "按回车返回菜单..." _
+        fi
+        ;;
+      8) 
+        uninstall_all
+        ;;
+      9) 
+        exit 0 
+        ;;
+      *) 
+        echo "输入错误"
+        sleep 1
+        ;;
+    esac
+  done
+}
+
+# ===== 入口 =====
+menu
+
