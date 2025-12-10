@@ -221,21 +221,6 @@ install_agent() {
     fi
   fi
     
-    # 从本地 ENV 文件读取默认值（如果有）
-    if [[ -f "$ENV_FILE" ]]; then
-      set +u
-      set +e
-      source "$ENV_FILE" 2>/dev/null
-      set -e
-      set -u
-      INSTANCE_DEFAULT="${INSTANCE:-}"
-      DISPLAY_NAME_DEFAULT="${DISPLAY_NAME:-${INSTANCE_DEFAULT}}"
-    else
-      INSTANCE_DEFAULT=""
-      DISPLAY_NAME_DEFAULT=""
-    fi
-  fi
-
   #------------------------------
   # 其他默认值（从本地 ENV 或使用系统默认）
   #------------------------------
