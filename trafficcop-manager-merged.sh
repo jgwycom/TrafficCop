@@ -365,6 +365,8 @@ METRICS_DIR="/run/trafficcop"
 while true; do
   : >"$METRICS_DIR/metrics.prom"
   CURRENT_DATE=$(date +%Y-%m-%d)
+  CURRENT_TS=$(date +%s)  # ⬅️ 【新增】获取当前时间戳
+  
   {
     echo "# HELP traffic_rx_bytes_total Total received bytes."
     echo "# TYPE traffic_rx_bytes_total counter"
@@ -374,6 +376,8 @@ while true; do
     echo "# TYPE traffic_iface_up gauge"
     echo "# HELP node_id Node ID."
     echo "# TYPE node_id gauge"
+    echo "# HELP push_time_seconds Last push timestamp."  # ⬅️ 【新增】
+    echo "# TYPE push_time_seconds gauge"                 # ⬅️ 【新增】
   } >"$METRICS_DIR/metrics.prom"
 
   ACTUAL_IFACES="${IFACES:-eth0}"
@@ -387,6 +391,7 @@ while true; do
   done
 
   echo "node_id $NODE_ID" >>"$METRICS_DIR/metrics.prom"
+  echo "push_time_seconds $CURRENT_TS" >>"$METRICS_DIR/metrics.prom"  # ⬅️ 【新增】推送当前时间戳
 
   curl -s -X PUT --data-binary @"$METRICS_DIR/metrics.prom" \
     "$PG_URL/metrics/job/$JOB/node_id/$NODE_ID/instance/$INSTANCE" || true
